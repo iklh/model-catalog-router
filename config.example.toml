@@ -1,0 +1,21 @@
+[server]
+listen = "127.0.0.1:8787"
+openai_compact_listen = "127.0.0.1:8788"
+
+[catalog]
+separator = "/"
+context_window = 128000
+
+[providers.newapi-a]
+base_url = "https://newapi-a.example.com/v1"
+api_key_env = "NEWAPI_A_API_KEY"
+enabled = true
+models = ["gpt-5", "gpt-5-mini"]
+remote_compaction_models = ["gpt-5"]
+
+[providers.newapi-b]
+base_url = "https://newapi-b.example.com/v1"
+api_key = "sk-replace-me"
+enabled = true
+models = ["claude-sonnet"]
+remote_compaction_models = []
