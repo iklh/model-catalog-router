@@ -1,4 +1,5 @@
 mod catalog;
+pub mod chat;
 mod cli;
 mod config;
 mod interactive;
