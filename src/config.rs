@@ -25,7 +25,7 @@ models = ["gpt-5"]
 remote_compaction_models = []
 "#;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -34,16 +34,6 @@ pub struct Config {
     pub catalog: CatalogConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            catalog: CatalogConfig::default(),
-            providers: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -634,7 +634,7 @@ fn profile_model_if_replacement_needed(
     models: &[crate::catalog::RoutedModel],
     profile_name: &str,
 ) -> Result<Option<String>> {
-    let Some(current) = sync::current_profile_model(&profile_path)? else {
+    let Some(current) = sync::current_profile_model(profile_path)? else {
         return Ok(None);
     };
     if models.is_empty() {
