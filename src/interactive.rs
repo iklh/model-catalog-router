@@ -283,7 +283,7 @@ fn prompt_credentials(
         println!("3) Environment variable");
         match prompt("Choice", Some("1"))?.as_str() {
             "1" => return Ok((current.api_key.clone(), current.api_key_env.clone())),
-            "2" => return Ok((Some(prompt_secret("API key")?), None)),
+            "2" => return Ok((Some(prompt_api_key()?), None)),
             "3" => return Ok((None, Some(prompt_required("Environment variable")?))),
             _ => bail!("invalid API key source choice"),
         }
@@ -293,7 +293,7 @@ fn prompt_credentials(
     println!("1) API key");
     println!("2) Environment variable");
     match prompt("Choice", Some("1"))?.as_str() {
-        "1" => Ok((Some(prompt_secret("API key")?), None)),
+        "1" => Ok((Some(prompt_api_key()?), None)),
         "2" => Ok((None, Some(prompt_required("Environment variable")?))),
         _ => bail!("invalid API key source choice"),
     }
@@ -678,16 +678,9 @@ fn prompt_required(label: &str) -> Result<String> {
     }
 }
 
-fn prompt_secret(label: &str) -> Result<String> {
-    loop {
-        println!("Enter {label} (input will not be shown):");
-        let value = rpassword::prompt_password(format!("{label}: "))?;
-        if !value.is_empty() {
-            println!("{label} received.");
-            return Ok(value);
-        }
-        println!("A value is required.");
-    }
+fn prompt_api_key() -> Result<String> {
+    println!("Enter API key (input will be visible).");
+    prompt_required("API key")
 }
 
 fn prompt(label: &str, default: Option<&str>) -> Result<String> {
