@@ -14,7 +14,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let mut config = Config::load_or_default(config_path)?;
     loop {
         print_menu(&config);
-        let choice = prompt("e/n/d/r/t/q> ", None)?.to_ascii_lowercase();
+        let choice = prompt("e/n/d/r/t/l/q> ", None)?.to_ascii_lowercase();
         if choice == "q" {
             return Ok(());
         }
@@ -24,9 +24,13 @@ pub async fn run(config_path: &Path) -> Result<()> {
             "d" => delete_provider(&config),
             "r" => refresh_provider(&config).await,
             "t" => toggle_provider(&config),
+            "l" => {
+                show_provider_models(&config)?;
+                continue;
+            }
             "" => continue,
             _ => {
-                println!("Unknown choice. Enter e, n, d, r, t, or q.");
+                println!("Unknown choice. Enter e, n, d, r, t, l, or q.");
                 continue;
             }
         };
@@ -112,7 +116,64 @@ fn print_menu(config: &Config) {
     println!("d) Delete provider");
     println!("r) Refresh provider models");
     println!("t) Toggle provider enabled");
+    println!("l) List provider models");
     println!("q) Quit configuration\n");
+}
+
+fn show_provider_models(config: &Config) -> Result<()> {
+    print_provider_models(config);
+    println!();
+    loop {
+        match prompt("b) Back to menu", Some("b"))?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "b" => return Ok(()),
+            _ => println!("Unknown choice. Enter b to return to the menu."),
+        }
+    }
+}
+
+fn print_provider_models(config: &Config) {
+    println!("\nCurrent providers with model names:\n");
+    if config.providers.is_empty() {
+        println!("  No providers configured.");
+        return;
+    }
+
+    let rows = config
+        .providers
+        .iter()
+        .map(|(name, provider)| {
+            let models = provider.models.join(", ");
+            (name, provider, models)
+        })
+        .collect::<Vec<_>>();
+    let model_list_width = rows
+        .iter()
+        .map(|(_, _, models)| models.len())
+        .max()
+        .unwrap_or_default()
+        .max("Model list".len());
+
+    println!(
+        "  #  Name                         Models  {:<model_list_width$}  Enabled",
+        "Model list"
+    );
+    println!(
+        "  -  ----                         ------  {:<model_list_width$}  -------",
+        "----------"
+    );
+    for (index, (name, provider, models)) in rows.iter().enumerate() {
+        println!(
+            "  {:<2} {:<28} {:>6}  {:<model_list_width$}  {}",
+            index + 1,
+            name,
+            provider.models.len(),
+            models,
+            if provider.enabled { "yes" } else { "no" }
+        );
+    }
 }
 
 async fn new_provider(config: &Config) -> Result<Option<Config>> {
