@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod interactive;
 mod proxy;
+pub mod responses;
 mod sync;
 
 use anyhow::{bail, Result};
