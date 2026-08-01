@@ -236,11 +236,13 @@ mod tests {
                 provider: "a".into(),
                 upstream_id: "one".into(),
                 routed_id: "a/one".into(),
+                uses_chat_completions: false,
             },
             RoutedModel {
                 provider: "b".into(),
                 upstream_id: "two".into(),
                 routed_id: "b/two".into(),
+                uses_chat_completions: false,
             },
         ];
         assert_eq!(

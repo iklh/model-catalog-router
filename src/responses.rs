@@ -14,25 +14,87 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub enum ResponsesToolKind {
     Function,
     Custom,
+    ToolSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredTool {
+    kind: ResponsesToolKind,
+    original_name: String,
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolRegistry {
-    tools: HashMap<String, ResponsesToolKind>,
+    tools: HashMap<String, RegisteredTool>,
+    namespaced_tools: HashMap<(String, String), String>,
 }
 
 impl ToolRegistry {
     pub fn kind(&self, name: &str) -> Option<ResponsesToolKind> {
-        self.tools.get(name).copied()
+        self.tools.get(name).map(|tool| tool.kind)
     }
 
     fn insert(&mut self, name: String, kind: ResponsesToolKind) -> Result<()> {
-        if let Some(previous) = self.tools.insert(name.clone(), kind) {
-            if previous != kind {
-                bail!("tool `{name}` is declared as both a function and a custom tool");
+        self.insert_registered(
+            name.clone(),
+            RegisteredTool {
+                kind,
+                original_name: name,
+                namespace: None,
+            },
+        )
+    }
+
+    fn insert_namespaced(&mut self, namespace: String, name: String) -> Result<String> {
+        let flattened = flatten_namespaced_tool_name(&namespace, &name);
+        self.insert_registered(
+            flattened.clone(),
+            RegisteredTool {
+                kind: ResponsesToolKind::Function,
+                original_name: name.clone(),
+                namespace: Some(namespace.clone()),
+            },
+        )?;
+        self.namespaced_tools
+            .insert((namespace, name), flattened.clone());
+        Ok(flattened)
+    }
+
+    fn insert_registered(&mut self, name: String, tool: RegisteredTool) -> Result<()> {
+        if let Some(previous) = self.tools.get(&name) {
+            if previous != &tool {
+                bail!(
+                    "tool name collision after namespace flattening: `{name}` refers to multiple tools"
+                );
             }
+            return Ok(());
         }
+        self.tools.insert(name, tool);
         Ok(())
+    }
+
+    fn chat_name(&self, namespace: Option<&str>, name: &str) -> String {
+        if let Some(namespace) = namespace {
+            return self
+                .namespaced_tools
+                .get(&(namespace.to_owned(), name.to_owned()))
+                .cloned()
+                .unwrap_or_else(|| flatten_namespaced_tool_name(namespace, name));
+        }
+        name.to_owned()
+    }
+
+    fn response_tool(&self, chat_name: &str) -> Option<&RegisteredTool> {
+        self.tools.get(chat_name)
+    }
+}
+
+fn flatten_namespaced_tool_name(namespace: &str, name: &str) -> String {
+    if namespace.ends_with("__") {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}__{name}")
     }
 }
 
@@ -60,14 +122,14 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
         }
     }
 
+    let mut registry = ToolRegistry::default();
+    let mut tools = convert_tools(object.get("tools"), &mut registry)?;
+    tools.extend(convert_input_tools(object.get("input"), &mut registry)?);
     if let Some(input) = object.get("input") {
-        convert_input(input, &mut messages)?;
+        convert_input(input, &mut messages, &registry)?;
     } else {
         bail!("Responses request must contain `input`");
     }
-
-    let mut registry = ToolRegistry::default();
-    let tools = convert_tools(object.get("tools"), &mut registry)?;
     let mut request = ChatCompletionRequest::new(model, messages, stream);
     request.tools = tools;
     request.tool_choice = convert_tool_choice(object.get("tool_choice"), &registry)?;
@@ -77,7 +139,8 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
         .and_then(Value::as_object)
         .and_then(|reasoning| reasoning.get("effort"))
         .map(|value| value_as_string(value, "`reasoning.effort`"))
-        .transpose()?;
+        .transpose()?
+        .filter(|effort| effort != "none");
     request.max_completion_tokens = optional_u64(object, "max_output_tokens")?;
     request.temperature = optional_f64(object, "temperature")?;
     if stream {
@@ -92,7 +155,33 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
     })
 }
 
-fn convert_input(input: &Value, messages: &mut Vec<ChatMessage>) -> Result<()> {
+fn convert_input_tools(
+    input: Option<&Value>,
+    registry: &mut ToolRegistry,
+) -> Result<Vec<ChatTool>> {
+    let Some(Value::Array(items)) = input else {
+        return Ok(Vec::new());
+    };
+    let mut converted = Vec::new();
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some("additional_tools") | Some("tool_search_output") => {
+                converted.extend(convert_tools(object.get("tools"), registry)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(converted)
+}
+
+fn convert_input(
+    input: &Value,
+    messages: &mut Vec<ChatMessage>,
+    registry: &ToolRegistry,
+) -> Result<()> {
     match input {
         Value::String(text) => {
             messages.push(ChatMessage::text(ChatRole::User, text));
@@ -100,7 +189,7 @@ fn convert_input(input: &Value, messages: &mut Vec<ChatMessage>) -> Result<()> {
         }
         Value::Array(items) => {
             for item in items {
-                convert_input_item(item, messages)?;
+                convert_input_item(item, messages, registry)?;
             }
             Ok(())
         }
@@ -108,7 +197,11 @@ fn convert_input(input: &Value, messages: &mut Vec<ChatMessage>) -> Result<()> {
     }
 }
 
-fn convert_input_item(item: &Value, messages: &mut Vec<ChatMessage>) -> Result<()> {
+fn convert_input_item(
+    item: &Value,
+    messages: &mut Vec<ChatMessage>,
+    registry: &ToolRegistry,
+) -> Result<()> {
     let object = item
         .as_object()
         .context("each Responses input item must be an object")?;
@@ -118,8 +211,14 @@ fn convert_input_item(item: &Value, messages: &mut Vec<ChatMessage>) -> Result<(
         .unwrap_or("message");
     match kind {
         "message" => convert_message_item(object, messages),
+        "agent_message" => convert_agent_message_item(object, messages),
         "function_call" => {
             let name = required_string(object, "name", "function_call item")?;
+            let namespace = object
+                .get("namespace")
+                .map(|value| value_as_string(value, "function_call item `namespace`"))
+                .transpose()?;
+            let name = registry.chat_name(namespace.as_deref(), &name);
             let call_id = required_string(object, "call_id", "function_call item")?;
             let arguments = required_string(object, "arguments", "function_call item")?;
             push_assistant_tool_call(
@@ -147,7 +246,29 @@ fn convert_input_item(item: &Value, messages: &mut Vec<ChatMessage>) -> Result<(
             );
             Ok(())
         }
-        "function_call_output" | "custom_tool_call_output" => {
+        "tool_search_call" => {
+            let execution = required_string(object, "execution", "tool_search_call item")?;
+            if execution != "client" {
+                return Ok(());
+            }
+            let call_id = required_string(object, "call_id", "tool_search_call item")?;
+            let arguments = object
+                .get("arguments")
+                .context("tool_search_call item must contain `arguments`")?;
+            push_assistant_tool_call(
+                messages,
+                ChatToolCall {
+                    id: call_id,
+                    kind: "function".to_owned(),
+                    function: ChatFunctionCall {
+                        name: "tool_search".to_owned(),
+                        arguments: serde_json::to_string(arguments)?,
+                    },
+                },
+            );
+            Ok(())
+        }
+        "function_call_output" | "custom_tool_call_output" | "mcp_tool_call_output" => {
             let call_id = required_string(object, "call_id", "tool output item")?;
             let output = object
                 .get("output")
@@ -162,6 +283,26 @@ fn convert_input_item(item: &Value, messages: &mut Vec<ChatMessage>) -> Result<(
             });
             Ok(())
         }
+        "tool_search_output" => {
+            let execution = required_string(object, "execution", "tool_search_output item")?;
+            if execution != "client" {
+                return Ok(());
+            }
+            let call_id = required_string(object, "call_id", "tool_search_output item")?;
+            let tools = object
+                .get("tools")
+                .context("tool_search_output item must contain `tools`")?;
+            messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: Some(Value::String(serde_json::to_string(tools)?)),
+                name: None,
+                tool_call_id: Some(call_id),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            });
+            Ok(())
+        }
+        "additional_tools" | "web_search_call" => Ok(()),
         "reasoning" => {
             let reasoning = reasoning_item_text(object)?;
             if !reasoning.is_empty() {
@@ -171,6 +312,49 @@ fn convert_input_item(item: &Value, messages: &mut Vec<ChatMessage>) -> Result<(
         }
         unsupported => bail!("unsupported Responses input item type `{unsupported}`"),
     }
+}
+
+fn convert_agent_message_item(
+    object: &Map<String, Value>,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
+    let author = required_string(object, "author", "agent_message item")?;
+    let recipient = required_string(object, "recipient", "agent_message item")?;
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .context("agent_message item must contain a `content` array")?;
+    let mut text_parts = Vec::new();
+    for part in content {
+        let part = part
+            .as_object()
+            .context("agent_message content parts must be objects")?;
+        let kind = required_string(part, "type", "agent_message content part")?;
+        match kind.as_str() {
+            "input_text" => text_parts.push(required_string(
+                part,
+                "text",
+                "agent_message text content part",
+            )?),
+            "encrypted_content" => {
+                bail!("encrypted agent_message content cannot be converted to Chat Completions")
+            }
+            unsupported => {
+                bail!("unsupported agent_message content type `{unsupported}`")
+            }
+        }
+    }
+    if text_parts.is_empty() {
+        return Ok(());
+    }
+    messages.push(ChatMessage::text(
+        ChatRole::Assistant,
+        format!(
+            "Agent message from {author} to {recipient}:\n{}",
+            text_parts.join("\n")
+        ),
+    ));
+    Ok(())
 }
 
 fn convert_message_item(
@@ -254,55 +438,115 @@ fn convert_tools(tools: Option<&Value>, registry: &mut ToolRegistry) -> Result<V
     let tools = tools
         .as_array()
         .context("Responses request `tools` must be an array")?;
-    tools
-        .iter()
-        .map(|tool| {
-            let object = tool
-                .as_object()
-                .context("each Responses tool must be an object")?;
-            let kind = required_string(object, "type", "Responses tool")?;
-            let name = required_string(object, "name", "Responses tool")?;
-            let description = object
-                .get("description")
-                .map(|value| value_as_string(value, "tool `description`"))
-                .transpose()?;
-            match kind.as_str() {
-                "function" => {
-                    registry.insert(name.clone(), ResponsesToolKind::Function)?;
-                    let parameters = object
+    let mut converted = Vec::new();
+    for tool in tools {
+        let object = tool
+            .as_object()
+            .context("each Responses tool must be an object")?;
+        let kind = required_string(object, "type", "Responses tool")?;
+        match kind.as_str() {
+            "function" => {
+                let name = required_string(object, "name", "Responses function tool")?;
+                let description = optional_tool_description(object)?;
+                registry.insert(name.clone(), ResponsesToolKind::Function)?;
+                converted.push(convert_function_tool(object, name, description)?);
+            }
+            "custom" => {
+                let name = required_string(object, "name", "Responses custom tool")?;
+                let description = optional_tool_description(object)?;
+                registry.insert(name.clone(), ResponsesToolKind::Custom)?;
+                converted.push(ChatTool::function(ChatFunctionDefinition {
+                    name,
+                    description,
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "The complete raw input for this custom tool."
+                            }
+                        },
+                        "required": ["input"],
+                        "additionalProperties": false
+                    }),
+                    strict: None,
+                }));
+            }
+            "namespace" => {
+                let name = required_string(object, "name", "Responses namespace tool")?;
+                let namespace_tools = object
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .context("Responses namespace tool must contain a `tools` array")?;
+                for namespace_tool in namespace_tools {
+                    let namespace_tool = namespace_tool
+                        .as_object()
+                        .context("each Responses namespace child tool must be an object")?;
+                    let child_kind =
+                        required_string(namespace_tool, "type", "Responses namespace child tool")?;
+                    if child_kind != "function" {
+                        bail!("unsupported Responses namespace child tool type `{child_kind}`");
+                    }
+                    let child_name =
+                        required_string(namespace_tool, "name", "Responses namespace child tool")?;
+                    let child_description = namespace_tool
+                        .get("description")
+                        .map(|value| value_as_string(value, "namespace tool `description`"))
+                        .transpose()?;
+                    let flattened_name = registry.insert_namespaced(name.clone(), child_name)?;
+                    converted.push(convert_function_tool(
+                        namespace_tool,
+                        flattened_name,
+                        child_description,
+                    )?);
+                }
+            }
+            "tool_search" => {
+                let execution = required_string(object, "execution", "Responses tool_search tool")?;
+                if execution != "client" {
+                    continue;
+                }
+                let name = "tool_search".to_owned();
+                registry.insert(name.clone(), ResponsesToolKind::ToolSearch)?;
+                converted.push(ChatTool::function(ChatFunctionDefinition {
+                    name,
+                    description: optional_tool_description(object)?,
+                    parameters: object
                         .get("parameters")
                         .cloned()
-                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-                    Ok(ChatTool::function(ChatFunctionDefinition {
-                        name,
-                        description,
-                        parameters,
-                        strict: optional_bool(object, "strict")?,
-                    }))
-                }
-                "custom" => {
-                    registry.insert(name.clone(), ResponsesToolKind::Custom)?;
-                    Ok(ChatTool::function(ChatFunctionDefinition {
-                        name,
-                        description,
-                        parameters: json!({
-                            "type": "object",
-                            "properties": {
-                                "input": {
-                                    "type": "string",
-                                    "description": "The complete raw input for this custom tool."
-                                }
-                            },
-                            "required": ["input"],
-                            "additionalProperties": false
-                        }),
-                        strict: None,
-                    }))
-                }
-                unsupported => bail!("unsupported Responses tool type `{unsupported}`"),
+                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+                    strict: None,
+                }));
             }
-        })
-        .collect()
+            "web_search" => {}
+            unsupported => bail!("unsupported Responses tool type `{unsupported}`"),
+        }
+    }
+    Ok(converted)
+}
+
+fn optional_tool_description(object: &Map<String, Value>) -> Result<Option<String>> {
+    object
+        .get("description")
+        .map(|value| value_as_string(value, "tool `description`"))
+        .transpose()
+}
+
+fn convert_function_tool(
+    object: &Map<String, Value>,
+    name: String,
+    description: Option<String>,
+) -> Result<ChatTool> {
+    let parameters = object
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+    Ok(ChatTool::function(ChatFunctionDefinition {
+        name,
+        description,
+        parameters,
+        strict: optional_bool(object, "strict")?,
+    }))
 }
 
 fn convert_tool_choice(choice: Option<&Value>, registry: &ToolRegistry) -> Result<Option<Value>> {
@@ -319,6 +563,11 @@ fn convert_tool_choice(choice: Option<&Value>, registry: &ToolRegistry) -> Resul
     match kind.as_str() {
         "function" | "custom" => {
             let name = required_string(object, "name", "`tool_choice`")?;
+            let namespace = object
+                .get("namespace")
+                .map(|value| value_as_string(value, "`tool_choice.namespace`"))
+                .transpose()?;
+            let name = registry.chat_name(namespace.as_deref(), &name);
             if registry.kind(&name).is_none() {
                 bail!("`tool_choice` refers to undeclared tool `{name}`");
             }
@@ -539,18 +788,19 @@ fn append_tool_outputs(
 ) -> Result<()> {
     for (index, call) in message.tool_calls.iter().enumerate() {
         let item_id = format!("{response_id}_tool_{index}");
-        match tools
-            .kind(&call.function.name)
+        let registered = tools.response_tool(&call.function.name);
+        match registered
+            .map(|tool| tool.kind)
             .unwrap_or(ResponsesToolKind::Function)
         {
-            ResponsesToolKind::Function => output.push(json!({
-                "id": item_id,
-                "type": "function_call",
-                "call_id": call.id,
-                "name": call.function.name,
-                "arguments": call.function.arguments,
-                "status": "completed"
-            })),
+            ResponsesToolKind::Function => output.push(response_function_call_item(
+                item_id,
+                call.id.clone(),
+                &call.function.name,
+                call.function.arguments.clone(),
+                "completed",
+                tools,
+            )),
             ResponsesToolKind::Custom => output.push(json!({
                 "id": item_id,
                 "type": "custom_tool_call",
@@ -559,9 +809,54 @@ fn append_tool_outputs(
                 "input": custom_input(&call.function.arguments),
                 "status": "completed"
             })),
+            ResponsesToolKind::ToolSearch => output.push(tool_search_call_item(
+                item_id,
+                call.id.clone(),
+                &call.function.arguments,
+                "completed",
+            )),
         }
     }
     Ok(())
+}
+
+fn tool_search_call_item(item_id: String, call_id: String, arguments: &str, status: &str) -> Value {
+    let arguments =
+        serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_owned()));
+    json!({
+        "id": item_id,
+        "type": "tool_search_call",
+        "call_id": call_id,
+        "execution": "client",
+        "arguments": arguments,
+        "status": status
+    })
+}
+
+fn response_function_call_item(
+    item_id: String,
+    call_id: String,
+    chat_name: &str,
+    arguments: String,
+    status: &str,
+    tools: &ToolRegistry,
+) -> Value {
+    let registered = tools.response_tool(chat_name);
+    let name = registered
+        .map(|tool| tool.original_name.as_str())
+        .unwrap_or(chat_name);
+    let mut item = json!({
+        "id": item_id,
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": status
+    });
+    if let Some(namespace) = registered.and_then(|tool| tool.namespace.as_deref()) {
+        item["namespace"] = json!(namespace);
+    }
+    item
 }
 
 fn custom_input(arguments: &str) -> String {
@@ -771,7 +1066,7 @@ impl ResponsesStreamConverter {
             {
                 let state = &self.tool_calls[&delta.index];
                 if state.started
-                    && self.tools.kind(&state.name) != Some(ResponsesToolKind::Custom)
+                    && self.tools.kind(&state.name) == Some(ResponsesToolKind::Function)
                     && !arguments.is_empty()
                 {
                     self.emit(
@@ -883,10 +1178,17 @@ impl ResponsesStreamConverter {
     }
 
     fn start_tool_if_ready(&mut self, index: usize, events: &mut Vec<Value>) {
-        let ready = self
-            .tool_calls
-            .get(&index)
-            .is_some_and(|tool| !tool.started && !tool.name.is_empty());
+        self.start_tool(index, events, false);
+    }
+
+    fn start_tool(&mut self, index: usize, events: &mut Vec<Value>, allow_unknown: bool) {
+        let ready = self.tool_calls.get(&index).is_some_and(|tool| {
+            !tool.started
+                && !tool.name.is_empty()
+                && (allow_unknown
+                    || (!tool.arguments.is_empty()
+                        && self.tools.response_tool(&tool.name).is_some()))
+        });
         if !ready {
             return;
         }
@@ -898,25 +1200,27 @@ impl ResponsesStreamConverter {
         if tool.call_id.is_empty() {
             tool.call_id = format!("call_{}_{}", self.response_id, index);
         }
-        let custom = self.tools.kind(&tool.name) == Some(ResponsesToolKind::Custom);
-        let item = if custom {
-            json!({
-                "id": tool.item_id,
+        let item_id = tool.item_id.clone().expect("tool item ID initialized");
+        let item = match self.tools.kind(&tool.name) {
+            Some(ResponsesToolKind::Custom) => json!({
+                "id": item_id,
                 "type": "custom_tool_call",
                 "call_id": tool.call_id,
                 "name": tool.name,
                 "input": "",
                 "status": "in_progress"
-            })
-        } else {
-            json!({
-                "id": tool.item_id,
-                "type": "function_call",
-                "call_id": tool.call_id,
-                "name": tool.name,
-                "arguments": "",
-                "status": "in_progress"
-            })
+            }),
+            Some(ResponsesToolKind::ToolSearch) => {
+                tool_search_call_item(item_id, tool.call_id.clone(), "{}", "in_progress")
+            }
+            _ => response_function_call_item(
+                item_id,
+                tool.call_id.clone(),
+                &tool.name,
+                String::new(),
+                "in_progress",
+                &self.tools,
+            ),
         };
         self.emit(
             events,
@@ -929,7 +1233,7 @@ impl ResponsesStreamConverter {
         let mut final_output = Vec::new();
         let tool_indices = self.tool_calls.keys().copied().collect::<Vec<_>>();
         for index in tool_indices {
-            self.start_tool_if_ready(index, events);
+            self.start_tool(index, events, true);
         }
 
         if let Some(reasoning) = self.reasoning.take() {
@@ -1025,72 +1329,88 @@ impl ResponsesStreamConverter {
                 .output_index
                 .context("started tool lacks output index")?;
             let item_id = tool.item_id.context("started tool lacks item ID")?;
-            if self.tools.kind(&tool.name) == Some(ResponsesToolKind::Custom) {
-                let input = custom_input(&tool.arguments);
-                if !input.is_empty() {
+            match self.tools.kind(&tool.name) {
+                Some(ResponsesToolKind::Custom) => {
+                    let input = custom_input(&tool.arguments);
+                    if !input.is_empty() {
+                        self.emit(
+                            events,
+                            "response.custom_tool_call_input.delta",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": input
+                            }),
+                        );
+                    }
                     self.emit(
                         events,
-                        "response.custom_tool_call_input.delta",
+                        "response.custom_tool_call_input.done",
                         json!({
                             "item_id": item_id,
                             "output_index": output_index,
-                            "delta": input
+                            "input": input
                         }),
                     );
+                    let item = json!({
+                        "id": item_id,
+                        "type": "custom_tool_call",
+                        "call_id": tool.call_id,
+                        "name": tool.name,
+                        "input": input,
+                        "status": "completed"
+                    });
+                    self.emit(
+                        events,
+                        "response.output_item.done",
+                        json!({
+                            "output_index": output_index,
+                            "item": item
+                        }),
+                    );
+                    final_output.push((output_index, item));
                 }
-                self.emit(
-                    events,
-                    "response.custom_tool_call_input.done",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "input": input
-                    }),
-                );
-                let item = json!({
-                    "id": item_id,
-                    "type": "custom_tool_call",
-                    "call_id": tool.call_id,
-                    "name": tool.name,
-                    "input": input,
-                    "status": "completed"
-                });
-                self.emit(
-                    events,
-                    "response.output_item.done",
-                    json!({
-                        "output_index": output_index,
-                        "item": item
-                    }),
-                );
-                final_output.push((output_index, item));
-            } else {
-                self.emit(
-                    events,
-                    "response.function_call_arguments.done",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "arguments": tool.arguments
-                    }),
-                );
-                let item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "call_id": tool.call_id,
-                    "name": tool.name,
-                    "arguments": tool.arguments,
-                    "status": "completed"
-                });
-                self.emit(
-                    events,
-                    "response.output_item.done",
-                    json!({
-                        "output_index": output_index,
-                        "item": item
-                    }),
-                );
-                final_output.push((output_index, item));
+                Some(ResponsesToolKind::ToolSearch) => {
+                    let item =
+                        tool_search_call_item(item_id, tool.call_id, &tool.arguments, "completed");
+                    self.emit(
+                        events,
+                        "response.output_item.done",
+                        json!({
+                            "output_index": output_index,
+                            "item": item
+                        }),
+                    );
+                    final_output.push((output_index, item));
+                }
+                _ => {
+                    self.emit(
+                        events,
+                        "response.function_call_arguments.done",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "arguments": tool.arguments
+                        }),
+                    );
+                    let item = response_function_call_item(
+                        item_id.clone(),
+                        tool.call_id,
+                        &tool.name,
+                        tool.arguments,
+                        "completed",
+                        &self.tools,
+                    );
+                    self.emit(
+                        events,
+                        "response.output_item.done",
+                        json!({
+                            "output_index": output_index,
+                            "item": item
+                        }),
+                    );
+                    final_output.push((output_index, item));
+                }
             }
         }
 
@@ -1391,6 +1711,306 @@ mod tests {
     }
 
     #[test]
+    fn omits_none_reasoning_effort_and_preserves_supported_levels() {
+        let none = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "hello",
+            "reasoning": { "effort": "none" }
+        }))
+        .unwrap();
+        assert_eq!(none.request.reasoning_effort, None);
+
+        let high = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "hello",
+            "reasoning": { "effort": "high" }
+        }))
+        .unwrap();
+        assert_eq!(high.request.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn converts_plaintext_agent_messages_to_assistant_messages() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": [{
+                "type": "agent_message",
+                "author": "worker",
+                "recipient": "root",
+                "content": [
+                    { "type": "input_text", "text": "Inspection complete." },
+                    { "type": "input_text", "text": "No issues found." }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(converted.request.messages.len(), 1);
+        assert_eq!(converted.request.messages[0].role, ChatRole::Assistant);
+        assert_eq!(
+            converted.request.messages[0].content,
+            Some(json!(
+                "Agent message from worker to root:\nInspection complete.\nNo issues found."
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_encrypted_agent_message_content() {
+        let error = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": [{
+                "type": "agent_message",
+                "author": "worker",
+                "recipient": "root",
+                "content": [{
+                    "type": "encrypted_content",
+                    "encrypted_content": "opaque"
+                }]
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("encrypted agent_message content cannot be converted"));
+    }
+
+    #[test]
+    fn flattens_namespace_tools_history_and_tool_choice() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": [
+                {
+                    "type": "function_call",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "call_id": "call_1",
+                    "arguments": "{\"task\":\"inspect\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "done"
+                }
+            ],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Agent collaboration tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn an agent",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "task": { "type": "string" } },
+                        "required": ["task"]
+                    }
+                }]
+            }],
+            "tool_choice": {
+                "type": "function",
+                "namespace": "collaboration",
+                "name": "spawn_agent"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(converted.request.tools.len(), 1);
+        assert_eq!(
+            converted.request.tools[0].function.name,
+            "collaboration__spawn_agent"
+        );
+        assert_eq!(
+            converted.request.messages[0].tool_calls[0].function.name,
+            "collaboration__spawn_agent"
+        );
+        assert_eq!(
+            converted.request.tool_choice,
+            Some(json!({
+                "type": "function",
+                "function": { "name": "collaboration__spawn_agent" }
+            }))
+        );
+    }
+
+    #[test]
+    fn preserves_mcp_namespace_separator_when_flattening() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "search",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__open_websearch__",
+                "tools": [{
+                    "type": "function",
+                    "name": "search",
+                    "parameters": { "type": "object", "properties": {} }
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            converted.request.tools[0].function.name,
+            "mcp__open_websearch__search"
+        );
+    }
+
+    #[test]
+    fn converts_client_tool_search_and_omits_hosted_web_search() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "find a calendar tool",
+            "tools": [
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": "Search available tools",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" },
+                            "limit": { "type": "integer" }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "type": "web_search",
+                    "external_web_access": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(converted.request.tools.len(), 1);
+        assert_eq!(converted.request.tools[0].function.name, "tool_search");
+        assert_eq!(
+            converted.tools.kind("tool_search"),
+            Some(ResponsesToolKind::ToolSearch)
+        );
+    }
+
+    #[test]
+    fn converts_additional_tools_and_tool_search_history() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Search available tools",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["query"]
+                        }
+                    }]
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "search-1",
+                    "execution": "client",
+                    "arguments": {
+                        "query": "calendar create",
+                        "limit": 1
+                    }
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "search-1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "calendar",
+                        "tools": [{
+                            "type": "function",
+                            "name": "create_event",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string" }
+                                },
+                                "required": ["title"]
+                            }
+                        }]
+                    }]
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            converted
+                .request
+                .tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tool_search", "calendar__create_event"]
+        );
+        assert_eq!(converted.request.messages.len(), 2);
+        assert_eq!(
+            converted.request.messages[0].tool_calls[0].function.name,
+            "tool_search"
+        );
+        assert_eq!(
+            converted.request.messages[0].tool_calls[0]
+                .function
+                .arguments,
+            "{\"limit\":1,\"query\":\"calendar create\"}"
+        );
+        assert_eq!(converted.request.messages[1].role, ChatRole::Tool);
+        assert_eq!(
+            converted.request.messages[1].tool_call_id.as_deref(),
+            Some("search-1")
+        );
+    }
+
+    #[test]
+    fn rejects_collisions_between_plain_and_flattened_namespace_tools() {
+        let error = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "collaboration__spawn_agent",
+                    "parameters": { "type": "object", "properties": {} }
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": { "type": "object", "properties": {} }
+                    }]
+                }
+            ]
+        }))
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("tool name collision after namespace flattening"));
+    }
+
+    #[test]
     fn rejects_unsupported_items_instead_of_dropping_them() {
         let error = responses_request_to_chat(&json!({
             "model": "model-a",
@@ -1469,6 +2089,84 @@ mod tests {
     fn custom_tool_malformed_wrapper_preserves_raw_arguments() {
         assert_eq!(custom_input("raw patch data"), "raw patch data");
         assert_eq!(custom_input("{\"wrong\":1}"), "{\"wrong\":1}");
+    }
+
+    #[test]
+    fn restores_namespace_in_non_streaming_function_calls() {
+        let mut tools = ToolRegistry::default();
+        tools
+            .insert_namespaced("collaboration".to_owned(), "spawn_agent".to_owned())
+            .unwrap();
+        let completion = ChatCompletionResponse {
+            id: Some("chatcmpl-namespace".to_owned()),
+            model: Some("glm-test".to_owned()),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatAssistantMessage {
+                    role: Some(ChatRole::Assistant),
+                    content: None,
+                    reasoning_content: None,
+                    refusal: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call_1".to_owned(),
+                        kind: "function".to_owned(),
+                        function: ChatFunctionCall {
+                            name: "collaboration__spawn_agent".to_owned(),
+                            arguments: "{\"task\":\"inspect\"}".to_owned(),
+                        },
+                    }],
+                },
+                finish_reason: Some("tool_calls".to_owned()),
+            }],
+            usage: None,
+        };
+
+        let response =
+            chat_completion_to_responses(&completion, "requested-model", &tools).unwrap();
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["namespace"], "collaboration");
+        assert_eq!(response["output"][0]["name"], "spawn_agent");
+    }
+
+    #[test]
+    fn restores_non_streaming_tool_search_calls() {
+        let mut tools = ToolRegistry::default();
+        tools
+            .insert("tool_search".to_owned(), ResponsesToolKind::ToolSearch)
+            .unwrap();
+        let completion = ChatCompletionResponse {
+            id: Some("chatcmpl-tool-search".to_owned()),
+            model: Some("glm-test".to_owned()),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatAssistantMessage {
+                    role: Some(ChatRole::Assistant),
+                    content: None,
+                    reasoning_content: None,
+                    refusal: None,
+                    tool_calls: vec![ChatToolCall {
+                        id: "search-1".to_owned(),
+                        kind: "function".to_owned(),
+                        function: ChatFunctionCall {
+                            name: "tool_search".to_owned(),
+                            arguments: "{\"query\":\"calendar\",\"limit\":2}".to_owned(),
+                        },
+                    }],
+                },
+                finish_reason: Some("tool_calls".to_owned()),
+            }],
+            usage: None,
+        };
+
+        let response =
+            chat_completion_to_responses(&completion, "requested-model", &tools).unwrap();
+        assert_eq!(response["output"][0]["type"], "tool_search_call");
+        assert_eq!(response["output"][0]["call_id"], "search-1");
+        assert_eq!(response["output"][0]["execution"], "client");
+        assert_eq!(
+            response["output"][0]["arguments"],
+            json!({ "query": "calendar", "limit": 2 })
+        );
     }
 
     #[test]
@@ -1569,6 +2267,115 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0]["sequence_number"].as_u64().unwrap() + 1
                 == pair[1]["sequence_number"].as_u64().unwrap()));
+    }
+
+    #[test]
+    fn streaming_conversion_restores_fragmented_namespace_tool_name() {
+        let mut tools = ToolRegistry::default();
+        tools
+            .insert_namespaced("collaboration".to_owned(), "spawn_agent".to_owned())
+            .unwrap();
+        let mut converter =
+            ResponsesStreamConverter::with_response_id("glm-test", tools, "resp_namespace");
+        let chunks = [
+            ChatStreamItem::Chunk(chunk(ChatDelta {
+                tool_calls: vec![tool_delta(0, Some("call_1"), Some("collaboration__"), None)],
+                ..ChatDelta::default()
+            })),
+            ChatStreamItem::Chunk(chunk(ChatDelta {
+                tool_calls: vec![tool_delta(
+                    0,
+                    None,
+                    Some("spawn_agent"),
+                    Some("{\"task\":\"inspect\"}"),
+                )],
+                ..ChatDelta::default()
+            })),
+            ChatStreamItem::Done,
+        ];
+
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(converter.push(chunk).unwrap());
+        }
+
+        let added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added"
+                    && event["item"]["type"] == "function_call"
+            })
+            .unwrap();
+        assert_eq!(added["item"]["namespace"], "collaboration");
+        assert_eq!(added["item"]["name"], "spawn_agent");
+
+        let done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "function_call"
+            })
+            .unwrap();
+        assert_eq!(done["item"]["namespace"], "collaboration");
+        assert_eq!(done["item"]["name"], "spawn_agent");
+
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed["response"]["output"][0]["namespace"],
+            "collaboration"
+        );
+        assert_eq!(completed["response"]["output"][0]["name"], "spawn_agent");
+    }
+
+    #[test]
+    fn streaming_conversion_restores_tool_search_calls() {
+        let mut tools = ToolRegistry::default();
+        tools
+            .insert("tool_search".to_owned(), ResponsesToolKind::ToolSearch)
+            .unwrap();
+        let mut converter =
+            ResponsesStreamConverter::with_response_id("glm-test", tools, "resp_tool_search");
+        let chunks = [
+            ChatStreamItem::Chunk(chunk(ChatDelta {
+                tool_calls: vec![tool_delta(
+                    0,
+                    Some("search-1"),
+                    Some("tool_search"),
+                    Some("{\"query\":\"cal"),
+                )],
+                ..ChatDelta::default()
+            })),
+            ChatStreamItem::Chunk(chunk(ChatDelta {
+                tool_calls: vec![tool_delta(0, None, None, Some("endar\",\"limit\":2}"))],
+                ..ChatDelta::default()
+            })),
+            ChatStreamItem::Done,
+        ];
+
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(converter.push(chunk).unwrap());
+        }
+
+        assert!(!events
+            .iter()
+            .any(|event| event["type"] == "response.function_call_arguments.delta"));
+        let done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "tool_search_call"
+            })
+            .unwrap();
+        assert_eq!(done["item"]["call_id"], "search-1");
+        assert_eq!(done["item"]["execution"], "client");
+        assert_eq!(
+            done["item"]["arguments"],
+            json!({ "query": "calendar", "limit": 2 })
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub struct RoutedModel {
     pub provider: String,
     pub upstream_id: String,
     pub routed_id: String,
+    #[serde(skip_serializing)]
+    pub uses_chat_completions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +83,7 @@ pub async fn fetch_models(config: &Config) -> Result<Vec<RoutedModel>> {
                 .map(|model| RoutedModel {
                     routed_id: format!("{name}{separator}{}", model.id),
                     provider: name.clone(),
+                    uses_chat_completions: provider.chat_models.contains(&model.id),
                     upstream_id: model.id,
                 })
                 .collect::<Vec<_>>();
@@ -143,16 +146,25 @@ pub async fn discover_provider_models(
 }
 
 pub fn configured_models(config: &Config) -> Vec<RoutedModel> {
-    configured_models_by(config, |provider| &provider.models)
+    configured_models_by(
+        config,
+        |provider| &provider.models,
+        |provider, model| provider.chat_models.iter().any(|chat| chat == model),
+    )
 }
 
 pub fn configured_openai_compact_models(config: &Config) -> Vec<RoutedModel> {
-    configured_models_by(config, |provider| &provider.remote_compaction_models)
+    configured_models_by(
+        config,
+        |provider| &provider.remote_compaction_models,
+        |_, _| false,
+    )
 }
 
 fn configured_models_by<'a>(
     config: &'a Config,
-    selected_models: impl Fn(&'a ProviderConfig) -> &'a [String],
+    selected_models: fn(&'a ProviderConfig) -> &'a [String],
+    uses_chat_completions: fn(&ProviderConfig, &str) -> bool,
 ) -> Vec<RoutedModel> {
     let separator = &config.catalog.separator;
     let mut models = config
@@ -166,6 +178,7 @@ fn configured_models_by<'a>(
                     provider: name.clone(),
                     upstream_id: model.clone(),
                     routed_id: format!("{name}{separator}{model}"),
+                    uses_chat_completions: uses_chat_completions(provider, model),
                 })
         })
         .collect::<Vec<_>>();
@@ -241,10 +254,14 @@ fn build_codex_catalog_with_originals(
         .enumerate()
         .map(|(index, model)| {
             let original = original_models.get(&model.upstream_id);
-            let supported_reasoning_levels = original
-                .and_then(|entry| entry.get("supported_reasoning_levels"))
-                .cloned()
-                .unwrap_or_else(|| json!([]));
+            let supported_reasoning_levels = if !is_openai_model(&model.upstream_id) {
+                chat_reasoning_levels()
+            } else {
+                original
+                    .and_then(|entry| entry.get("supported_reasoning_levels"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+            };
             let default_reasoning_level = if reasoning_level_is_supported(
                 &supported_reasoning_levels,
                 DEFAULT_REASONING_EFFORT,
@@ -291,6 +308,35 @@ fn build_codex_catalog_with_originals(
         })
         .collect::<Vec<_>>();
     json!({ "models": entries })
+}
+
+fn is_openai_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    ["gpt", "o1", "o3", "o4", "codex"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
+fn chat_reasoning_levels() -> Value {
+    json!([
+        {
+            "effort": "none",
+            "description": "Do not specify a reasoning effort."
+        },
+        {
+            "effort": "low",
+            "description": "Faster responses with less reasoning."
+        },
+        {
+            "effort": "medium",
+            "description": "Balances speed and reasoning."
+        },
+        {
+            "effort": "high",
+            "description": "More reasoning for complex tasks."
+        }
+    ])
 }
 
 fn reasoning_level_is_supported(levels: &Value, effort: &str) -> bool {
@@ -357,6 +403,7 @@ mod tests {
             provider: "alpha".into(),
             upstream_id: "gpt-test".into(),
             routed_id: "alpha/gpt-test".into(),
+            uses_chat_completions: false,
         }];
         let catalog = build_codex_catalog(&models, 64_000);
         assert_eq!(catalog["models"][0]["slug"], "alpha/gpt-test");
@@ -395,6 +442,120 @@ mod tests {
         assert_eq!(compact.len(), 1);
         assert_eq!(compact[0].upstream_id, "sol");
         assert_eq!(compact[0].routed_id, "alpha/sol");
+        assert!(!compact[0].uses_chat_completions);
+    }
+
+    #[test]
+    fn chat_models_use_fixed_reasoning_levels() {
+        let provider = ProviderConfig {
+            base_url: Url::parse("https://example.com/v1").unwrap(),
+            api_key: Some("secret".into()),
+            api_key_env: None,
+            enabled: true,
+            models: vec!["glm-test".into(), "gpt-test".into()],
+            chat_models: vec!["glm-test".into()],
+            remote_compaction_models: Vec::new(),
+        };
+        let config = Config {
+            providers: BTreeMap::from([("alpha".to_owned(), provider)]),
+            ..Config::default()
+        };
+        let models = configured_models(&config);
+        let catalog = build_codex_catalog_with_originals(&models, 64_000, &BTreeMap::new());
+        let entries = catalog["models"].as_array().unwrap();
+        let chat = entries
+            .iter()
+            .find(|entry| entry["slug"] == "alpha/glm-test")
+            .unwrap();
+        let native = entries
+            .iter()
+            .find(|entry| entry["slug"] == "alpha/gpt-test")
+            .unwrap();
+
+        assert_eq!(
+            chat["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["none", "low", "medium", "high"]
+        );
+        assert_eq!(chat["default_reasoning_level"], DEFAULT_REASONING_EFFORT);
+        assert_eq!(native["supported_reasoning_levels"], json!([]));
+    }
+
+    #[test]
+    fn non_openai_models_use_fixed_reasoning_levels_regardless_of_transport() {
+        let models = vec![
+            RoutedModel {
+                provider: "alpha".into(),
+                upstream_id: "grok-4".into(),
+                routed_id: "alpha/grok-4".into(),
+                uses_chat_completions: false,
+            },
+            RoutedModel {
+                provider: "alpha".into(),
+                upstream_id: "claude-sonnet".into(),
+                routed_id: "alpha/claude-sonnet".into(),
+                uses_chat_completions: true,
+            },
+        ];
+        let catalog = build_codex_catalog_with_originals(
+            &models,
+            64_000,
+            &BTreeMap::from([
+                (
+                    "grok-4".to_owned(),
+                    json!({ "supported_reasoning_levels": [] }),
+                ),
+                (
+                    "claude-sonnet".to_owned(),
+                    json!({ "supported_reasoning_levels": [] }),
+                ),
+            ]),
+        );
+
+        for entry in catalog["models"].as_array().unwrap() {
+            assert_eq!(entry["supported_reasoning_levels"], chat_reasoning_levels());
+            assert_eq!(entry["default_reasoning_level"], DEFAULT_REASONING_EFFORT);
+        }
+    }
+
+    #[test]
+    fn openai_model_families_keep_upstream_reasoning_levels() {
+        let models = ["gpt-5", "o3", "o4-mini", "codex-mini"]
+            .into_iter()
+            .map(|model| RoutedModel {
+                provider: "alpha".into(),
+                upstream_id: model.into(),
+                routed_id: format!("alpha/{model}"),
+                uses_chat_completions: false,
+            })
+            .collect::<Vec<_>>();
+        let originals = models
+            .iter()
+            .map(|model| {
+                (
+                    model.upstream_id.clone(),
+                    json!({
+                        "supported_reasoning_levels": [
+                            { "effort": "high", "description": "Deep" }
+                        ],
+                        "default_reasoning_level": "high"
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let catalog = build_codex_catalog_with_originals(&models, 64_000, &originals);
+        for entry in catalog["models"].as_array().unwrap() {
+            assert_eq!(
+                entry["supported_reasoning_levels"],
+                json!([{ "effort": "high", "description": "Deep" }])
+            );
+            assert_eq!(entry["default_reasoning_level"], "high");
+        }
     }
 
     #[test]
@@ -403,6 +564,7 @@ mod tests {
             provider: "alpha".into(),
             upstream_id: "gpt-test".into(),
             routed_id: "alpha/gpt-test".into(),
+            uses_chat_completions: false,
         }];
         let originals = BTreeMap::from([(
             "gpt-test".to_owned(),
@@ -431,6 +593,7 @@ mod tests {
             provider: "alpha".into(),
             upstream_id: "gpt-test".into(),
             routed_id: "alpha/gpt-test".into(),
+            uses_chat_completions: false,
         }];
         let originals = BTreeMap::from([(
             "gpt-test".to_owned(),
@@ -459,6 +622,7 @@ mod tests {
             provider: "alpha".into(),
             upstream_id: "gpt-test".into(),
             routed_id: "alpha/gpt-test".into(),
+            uses_chat_completions: false,
         }];
         let originals = BTreeMap::from([(
             "gpt-test".to_owned(),

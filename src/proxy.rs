@@ -1,14 +1,22 @@
-use crate::config::Config;
+use crate::chat::{ChatClient, ChatResponse, ChatStream};
+use crate::config::{Config, ProviderConfig};
+use crate::responses::{
+    chat_completion_to_responses, responses_request_to_chat, responses_sse_event,
+    ResponsesStreamConverter, ToolRegistry,
+};
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use axum::http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, TRANSFER_ENCODING,
+};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
-use futures_util::TryStreamExt;
+use futures_util::{stream, TryStreamExt};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
@@ -214,6 +222,25 @@ async fn forward(
     };
     payload["model"] = Value::String(forwarded_model.clone());
 
+    if state.mode == ServiceMode::Base
+        && method == Method::POST
+        && path == "responses"
+        && provider
+            .chat_models
+            .iter()
+            .any(|model| model == &upstream_model)
+    {
+        info!(
+            provider = provider_name,
+            model = forwarded_model,
+            path,
+            mode = state.mode.name(),
+            transport = "chat-completions",
+            "converting Responses request"
+        );
+        return forward_responses_via_chat(&state.client, &provider_name, provider, &payload).await;
+    }
+
     let mut endpoint = provider.endpoint(path).map_err(ProxyError::internal)?;
     endpoint.set_query(uri.query());
     let api_key = provider
@@ -239,6 +266,93 @@ async fn forward(
     );
     let upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
     response_from_upstream(upstream)
+}
+
+async fn forward_responses_via_chat(
+    client: &reqwest::Client,
+    provider_name: &str,
+    provider: &ProviderConfig,
+    payload: &Value,
+) -> Result<Response, ProxyError> {
+    let converted = responses_request_to_chat(payload).map_err(ProxyError::bad_request)?;
+    let requested_model = converted.request.model.clone();
+    let response = ChatClient::from_client(client.clone())
+        .send(provider_name, provider, &converted.request)
+        .await
+        .map_err(ProxyError::bad_gateway)?;
+
+    match response {
+        ChatResponse::Completion(completion) => {
+            let response =
+                chat_completion_to_responses(&completion, &requested_model, &converted.tools)
+                    .map_err(ProxyError::bad_gateway)?;
+            Ok(Json(response).into_response())
+        }
+        ChatResponse::Stream(stream) => Ok(chat_stream_to_responses(
+            stream,
+            requested_model,
+            converted.tools,
+        )),
+    }
+}
+
+fn chat_stream_to_responses(
+    stream: ChatStream,
+    requested_model: String,
+    tools: ToolRegistry,
+) -> Response {
+    struct StreamState {
+        upstream: ChatStream,
+        converter: ResponsesStreamConverter,
+        pending: VecDeque<Bytes>,
+        finished: bool,
+    }
+
+    let state = StreamState {
+        upstream: stream,
+        converter: ResponsesStreamConverter::new(requested_model, tools),
+        pending: VecDeque::new(),
+        finished: false,
+    };
+    let body_stream = stream::try_unfold(state, |mut state| async move {
+        loop {
+            if let Some(bytes) = state.pending.pop_front() {
+                return Ok::<_, std::io::Error>(Some((bytes, state)));
+            }
+            if state.finished {
+                return Ok(None);
+            }
+
+            let events = match state
+                .upstream
+                .next_event()
+                .await
+                .map_err(std::io::Error::other)?
+            {
+                Some(item) => {
+                    let done = matches!(&item, crate::chat::ChatStreamItem::Done);
+                    let events = state.converter.push(item).map_err(std::io::Error::other)?;
+                    if done {
+                        state.finished = true;
+                    }
+                    events
+                }
+                None => {
+                    state.finished = true;
+                    state.converter.finish().map_err(std::io::Error::other)?
+                }
+            };
+            for event in events {
+                let serialized = responses_sse_event(&event).map_err(std::io::Error::other)?;
+                state.pending.push_back(Bytes::from(serialized));
+            }
+        }
+    });
+
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(body_stream))
+        .expect("valid Responses stream response")
 }
 
 fn response_from_upstream(upstream: reqwest::Response) -> Result<Response, ProxyError> {
@@ -429,6 +543,387 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn converts_non_streaming_responses_for_chat_models() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<Value>>>);
+
+        async fn upstream(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+            Json(payload): Json<Value>,
+        ) -> Response {
+            assert_eq!(
+                headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer upstream-secret")
+            );
+            *capture.0.lock().unwrap() = Some(payload);
+            Json(json!({
+                "id": "chat-1",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "converted reply"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 3,
+                    "total_tokens": 11
+                }
+            }))
+            .into_response()
+        }
+
+        let capture = Capture::default();
+        let upstream_app = Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(capture.clone());
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let config = Config {
+            providers: BTreeMap::from([(
+                "alpha".to_owned(),
+                ProviderConfig {
+                    base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    api_key: Some("upstream-secret".to_owned()),
+                    api_key_env: None,
+                    enabled: true,
+                    models: vec!["glm-test".to_owned()],
+                    chat_models: vec!["glm-test".to_owned()],
+                    remote_compaction_models: Vec::new(),
+                },
+            )]),
+            ..Config::default()
+        };
+        let router_state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "instructions": "Be concise.",
+                "input": "hello",
+                "reasoning": { "effort": "none" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["model"], "glm-test");
+        assert_eq!(
+            response["output"][0]["content"][0]["text"],
+            "converted reply"
+        );
+        assert_eq!(response["usage"]["total_tokens"], 11);
+
+        let captured = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(captured["model"], "glm-test");
+        assert_eq!(captured["stream"], false);
+        assert_eq!(captured["messages"][0]["role"], "system");
+        assert_eq!(captured["messages"][0]["content"], "Be concise.");
+        assert_eq!(captured["messages"][1]["role"], "user");
+        assert_eq!(captured["messages"][1]["content"], "hello");
+        assert!(captured.get("reasoning_effort").is_none());
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn converts_namespace_tools_through_chat_models() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<Value>>>);
+
+        async fn upstream(State(capture): State<Capture>, Json(payload): Json<Value>) -> Response {
+            *capture.0.lock().unwrap() = Some(payload);
+            Json(json!({
+                "id": "chat-namespace",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "collaboration__spawn_agent",
+                                "arguments": "{\"task\":\"inspect\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .into_response()
+        }
+
+        let capture = Capture::default();
+        let upstream_app = Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(capture.clone());
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let config = Config {
+            providers: BTreeMap::from([(
+                "alpha".to_owned(),
+                ProviderConfig {
+                    base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    api_key: Some("upstream-secret".to_owned()),
+                    api_key_env: None,
+                    enabled: true,
+                    models: vec!["glm-test".to_owned()],
+                    chat_models: vec!["glm-test".to_owned()],
+                    remote_compaction_models: Vec::new(),
+                },
+            )]),
+            ..Config::default()
+        };
+        let router_state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "inspect",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "task": { "type": "string" } }
+                        }
+                    }]
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["namespace"], "collaboration");
+        assert_eq!(response["output"][0]["name"], "spawn_agent");
+
+        let captured = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            captured["tools"][0]["function"]["name"],
+            "collaboration__spawn_agent"
+        );
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn converts_tool_search_and_omits_web_search_for_chat_models() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Option<Value>>>);
+
+        async fn upstream(State(capture): State<Capture>, Json(payload): Json<Value>) -> Response {
+            *capture.0.lock().unwrap() = Some(payload);
+            Json(json!({
+                "id": "chat-tool-search",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "search-1",
+                            "type": "function",
+                            "function": {
+                                "name": "tool_search",
+                                "arguments": "{\"query\":\"calendar\",\"limit\":1}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .into_response()
+        }
+
+        let capture = Capture::default();
+        let upstream_app = Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(capture.clone());
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let config = Config {
+            providers: BTreeMap::from([(
+                "alpha".to_owned(),
+                ProviderConfig {
+                    base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    api_key: Some("upstream-secret".to_owned()),
+                    api_key_env: None,
+                    enabled: true,
+                    models: vec!["glm-test".to_owned()],
+                    chat_models: vec!["glm-test".to_owned()],
+                    remote_compaction_models: Vec::new(),
+                },
+            )]),
+            ..Config::default()
+        };
+        let router_state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "find a calendar tool",
+                "tools": [
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Search available tools",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" },
+                                "limit": { "type": "integer" }
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "type": "web_search",
+                        "external_web_access": true
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(response["output"][0]["type"], "tool_search_call");
+        assert_eq!(response["output"][0]["call_id"], "search-1");
+        assert_eq!(response["output"][0]["execution"], "client");
+        assert_eq!(
+            response["output"][0]["arguments"],
+            json!({ "query": "calendar", "limit": 1 })
+        );
+
+        let captured = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(captured["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(captured["tools"][0]["function"]["name"], "tool_search");
+        assert!(captured["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["function"]["name"] != "web_search"));
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn converts_streaming_chat_events_to_responses_sse() {
+        async fn upstream(Json(payload): Json<Value>) -> Response {
+            assert_eq!(payload["model"], "glm-test");
+            assert_eq!(payload["stream"], true);
+            assert_eq!(payload["stream_options"]["include_usage"], true);
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"id\":\"chat-1\",\"model\":\"glm-test\",\"choices\":[",
+                    "{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n",
+                    "data: {\"id\":\"chat-1\",\"choices\":[],\"usage\":",
+                    "{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+                    "data: [DONE]\n\n"
+                )))
+                .unwrap()
+        }
+
+        let upstream_app = Router::new().route("/v1/chat/completions", post(upstream));
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let config = Config {
+            providers: BTreeMap::from([(
+                "alpha".to_owned(),
+                ProviderConfig {
+                    base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    api_key: Some("upstream-secret".to_owned()),
+                    api_key_env: None,
+                    enabled: true,
+                    models: vec!["glm-test".to_owned()],
+                    chat_models: vec!["glm-test".to_owned()],
+                    remote_compaction_models: Vec::new(),
+                },
+            )]),
+            ..Config::default()
+        };
+        let router_state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "hello",
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("\"delta\":\"hello\""));
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("\"total_tokens\":7"));
 
         router_task.abort();
         upstream_task.abort();
