@@ -92,6 +92,154 @@ pub enum ChatResponse {
     Stream(ChatStream),
 }
 
+impl ChatResponse {
+    pub async fn into_completion(self, requested_model: &str) -> Result<ChatCompletionResponse> {
+        match self {
+            Self::Completion(completion) => Ok(completion),
+            Self::Stream(mut stream) => {
+                let mut id = None;
+                let mut model = None;
+                let mut choices = BTreeMap::<usize, CollectedChoice>::new();
+                let mut usage = None;
+                while let Some(item) = stream.next_event().await? {
+                    let ChatStreamItem::Chunk(chunk) = item else {
+                        break;
+                    };
+                    if chunk.id.is_some() {
+                        id = chunk.id;
+                    }
+                    if chunk.model.is_some() {
+                        model = chunk.model;
+                    }
+                    if chunk.usage.is_some() {
+                        usage = chunk.usage;
+                    }
+                    for choice in chunk.choices {
+                        choices.entry(choice.index).or_default().push(choice);
+                    }
+                }
+                if choices.is_empty() {
+                    bail!("Chat completion stream contained no choices");
+                }
+                Ok(ChatCompletionResponse {
+                    id,
+                    model: model.or_else(|| Some(requested_model.to_owned())),
+                    choices: choices
+                        .into_iter()
+                        .map(|(index, choice)| choice.finish(index))
+                        .collect(),
+                    usage,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CollectedChoice {
+    role: Option<ChatRole>,
+    content: Option<Value>,
+    reasoning_content: Option<Value>,
+    refusal: Option<Value>,
+    tool_calls: BTreeMap<usize, CollectedToolCall>,
+    finish_reason: Option<String>,
+}
+
+impl CollectedChoice {
+    fn push(&mut self, choice: ChatChunkChoice) {
+        if choice.delta.role.is_some() {
+            self.role = choice.delta.role;
+        }
+        append_stream_value(&mut self.content, choice.delta.content);
+        append_stream_value(
+            &mut self.reasoning_content,
+            choice.delta.reasoning_content.or(choice.delta.reasoning),
+        );
+        append_stream_value(&mut self.refusal, choice.delta.refusal);
+        for delta in choice.delta.tool_calls {
+            self.tool_calls.entry(delta.index).or_default().push(delta);
+        }
+        if choice.finish_reason.is_some() {
+            self.finish_reason = choice.finish_reason;
+        }
+    }
+
+    fn finish(self, index: usize) -> ChatChoice {
+        ChatChoice {
+            index,
+            message: ChatAssistantMessage {
+                role: self.role.or(Some(ChatRole::Assistant)),
+                content: self.content,
+                reasoning_content: self.reasoning_content,
+                refusal: self.refusal,
+                tool_calls: self
+                    .tool_calls
+                    .into_values()
+                    .map(CollectedToolCall::finish)
+                    .collect(),
+            },
+            finish_reason: self.finish_reason,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CollectedToolCall {
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+}
+
+impl CollectedToolCall {
+    fn push(&mut self, delta: ChatToolCallDelta) {
+        if let Some(id) = delta.id {
+            self.id.push_str(&id);
+        }
+        if let Some(kind) = delta.kind {
+            self.kind.push_str(&kind);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                self.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                self.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    fn finish(self) -> ChatToolCall {
+        ChatToolCall {
+            id: self.id,
+            kind: if self.kind.is_empty() {
+                "function".to_owned()
+            } else {
+                self.kind
+            },
+            function: ChatFunctionCall {
+                name: self.name,
+                arguments: self.arguments,
+            },
+        }
+    }
+}
+
+fn append_stream_value(target: &mut Option<Value>, delta: Option<Value>) {
+    let Some(delta) = delta else {
+        return;
+    };
+    match (target.as_mut(), delta) {
+        (None, delta) => *target = Some(delta),
+        (Some(Value::String(current)), Value::String(delta)) => current.push_str(&delta),
+        (Some(Value::Array(current)), Value::Array(mut delta)) => current.append(&mut delta),
+        (Some(current), delta) => {
+            let previous = std::mem::replace(current, Value::Null);
+            *current = Value::Array(vec![previous, delta]);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -607,6 +755,57 @@ data: [DONE]
         );
         assert_eq!(second.usage.as_ref().unwrap().total_tokens, Some(14));
         assert_eq!(items[2], ChatStreamItem::Done);
+    }
+
+    #[tokio::test]
+    async fn response_collects_streamed_text_tool_call_and_usage() {
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            br#"data: {"id":"chat-1","model":"model-a","choices":[{"index":0,"delta":{"role":"assistant","content":"hello ","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"web_","arguments":"{\"query\":"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"world","tool_calls":[{"index":0,"function":{"name":"search","arguments":"\"Rust\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}
+
+data: [DONE]
+
+"#,
+        ))])
+        .boxed();
+
+        let completion = ChatResponse::Stream(ChatStream::new(upstream))
+            .into_completion("fallback-model")
+            .await
+            .unwrap();
+
+        assert_eq!(completion.id.as_deref(), Some("chat-1"));
+        assert_eq!(completion.model.as_deref(), Some("model-a"));
+        assert_eq!(completion.choices.len(), 1);
+        assert_eq!(
+            completion.choices[0].message.content,
+            Some(json!("hello world"))
+        );
+        assert_eq!(
+            completion.choices[0].message.tool_calls,
+            vec![ChatToolCall {
+                id: "call-1".to_owned(),
+                kind: "function".to_owned(),
+                function: ChatFunctionCall {
+                    name: "web_search".to_owned(),
+                    arguments: "{\"query\":\"Rust\"}".to_owned(),
+                },
+            }]
+        );
+        assert_eq!(
+            completion.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            completion.usage,
+            Some(ChatUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(4),
+                total_tokens: Some(14),
+                details: BTreeMap::new(),
+            })
+        );
     }
 
     #[test]

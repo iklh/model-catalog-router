@@ -1,8 +1,15 @@
-use crate::chat::{ChatClient, ChatResponse, ChatStream};
+use crate::chat::{
+    ChatAssistantMessage, ChatChunkChoice, ChatClient, ChatCompletionChunk, ChatCompletionResponse,
+    ChatDelta, ChatFunctionCallDelta, ChatMessage, ChatResponse, ChatRole, ChatStream,
+    ChatStreamItem, ChatToolCallDelta, ChatUsage,
+};
 use crate::config::{Config, ProviderConfig};
 use crate::responses::{
-    chat_completion_to_responses, responses_request_to_chat, responses_sse_event,
+    chat_completion_to_responses, responses_request_to_chat_with_web_search, responses_sse_event,
     ResponsesStreamConverter, ToolRegistry,
+};
+use crate::web_search::{
+    WebSearchBackend, WebSearchRequest, INTERNAL_WEB_SEARCH_TOOL_NAME, MAX_WEB_SEARCH_ROUNDS,
 };
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
@@ -14,7 +21,7 @@ use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
-use futures_util::{stream, TryStreamExt};
+use futures_util::{future::join_all, stream, TryStreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,6 +34,7 @@ struct AppState {
     config: Arc<Config>,
     client: reqwest::Client,
     mode: ServiceMode,
+    web_search: Option<Arc<dyn WebSearchBackend>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +137,7 @@ fn build_router(config: Config, mode: ServiceMode) -> Result<Router> {
         config: Arc::new(config),
         client,
         mode,
+        web_search: None,
     };
     Ok(Router::new()
         .route("/health", get(health))
@@ -238,7 +247,14 @@ async fn forward(
             transport = "chat-completions",
             "converting Responses request"
         );
-        return forward_responses_via_chat(&state.client, &provider_name, provider, &payload).await;
+        return forward_responses_via_chat(
+            &state.client,
+            &provider_name,
+            provider,
+            &payload,
+            state.web_search.clone(),
+        )
+        .await;
     }
 
     let mut endpoint = provider.endpoint(path).map_err(ProxyError::internal)?;
@@ -273,27 +289,258 @@ async fn forward_responses_via_chat(
     provider_name: &str,
     provider: &ProviderConfig,
     payload: &Value,
+    web_search: Option<Arc<dyn WebSearchBackend>>,
 ) -> Result<Response, ProxyError> {
-    let converted = responses_request_to_chat(payload).map_err(ProxyError::bad_request)?;
+    let converted = responses_request_to_chat_with_web_search(payload, web_search.is_some())
+        .map_err(ProxyError::bad_request)?;
     let requested_model = converted.request.model.clone();
-    let response = ChatClient::from_client(client.clone())
-        .send(provider_name, provider, &converted.request)
-        .await
-        .map_err(ProxyError::bad_gateway)?;
+    let bridge_active = converted
+        .request
+        .tools
+        .iter()
+        .any(|tool| tool.function.name == INTERNAL_WEB_SEARCH_TOOL_NAME);
+    let Some(web_search) = web_search.filter(|_| bridge_active) else {
+        let response = ChatClient::from_client(client.clone())
+            .send(provider_name, provider, &converted.request)
+            .await
+            .map_err(ProxyError::bad_gateway)?;
 
-    match response {
-        ChatResponse::Completion(completion) => {
-            let response =
-                chat_completion_to_responses(&completion, &requested_model, &converted.tools)
-                    .map_err(ProxyError::bad_gateway)?;
-            Ok(Json(response).into_response())
+        return match response {
+            ChatResponse::Completion(completion) => {
+                let response =
+                    chat_completion_to_responses(&completion, &requested_model, &converted.tools)
+                        .map_err(ProxyError::bad_gateway)?;
+                Ok(Json(response).into_response())
+            }
+            ChatResponse::Stream(stream) => Ok(chat_stream_to_responses(
+                stream,
+                requested_model,
+                converted.tools,
+            )),
+        };
+    };
+
+    let original_stream = converted.request.stream;
+    let mut request = converted.request;
+    request.stream = false;
+    request.stream_options = None;
+    let chat_client = ChatClient::from_client(client.clone());
+    let mut search_rounds = 0;
+    let mut usage = UsageAccumulator::default();
+
+    loop {
+        let mut completion = chat_client
+            .send(provider_name, provider, &request)
+            .await
+            .map_err(ProxyError::bad_gateway)?
+            .into_completion(&requested_model)
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+        usage.add(completion.usage.as_ref());
+
+        let choice = completion
+            .choices
+            .iter()
+            .find(|choice| choice.index == 0)
+            .or_else(|| completion.choices.first())
+            .ok_or_else(|| ProxyError::bad_gateway("Chat completion contained no choices"))?;
+        let internal_calls = choice
+            .message
+            .tool_calls
+            .iter()
+            .filter(|call| call.function.name == INTERNAL_WEB_SEARCH_TOOL_NAME)
+            .collect::<Vec<_>>();
+        let has_external_calls = choice
+            .message
+            .tool_calls
+            .iter()
+            .any(|call| call.function.name != INTERNAL_WEB_SEARCH_TOOL_NAME);
+
+        if internal_calls.is_empty() {
+            completion.usage = usage.finish();
+            return if original_stream {
+                completion_to_responses_stream(completion, requested_model, converted.tools)
+                    .map_err(ProxyError::bad_gateway)
+            } else {
+                let response =
+                    chat_completion_to_responses(&completion, &requested_model, &converted.tools)
+                        .map_err(ProxyError::bad_gateway)?;
+                Ok(Json(response).into_response())
+            };
         }
-        ChatResponse::Stream(stream) => Ok(chat_stream_to_responses(
-            stream,
-            requested_model,
-            converted.tools,
-        )),
+
+        if has_external_calls {
+            return Err(ProxyError::bad_gateway(
+                "Chat model returned Router Web Search and external tool calls in the same round",
+            ));
+        }
+        if search_rounds == MAX_WEB_SEARCH_ROUNDS {
+            return Err(ProxyError::bad_gateway(format!(
+                "Chat model exceeded the maximum of {MAX_WEB_SEARCH_ROUNDS} Web Search rounds"
+            )));
+        }
+        search_rounds += 1;
+
+        let searches = internal_calls
+            .iter()
+            .map(|call| {
+                WebSearchRequest::from_arguments(&call.function.arguments)
+                    .map(|search| (call.id.clone(), search))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(ProxyError::bad_gateway)?;
+        let results = join_all(
+            searches
+                .iter()
+                .map(|(_, search)| web_search.search(search.clone())),
+        )
+        .await;
+
+        request
+            .messages
+            .push(assistant_message_for_follow_up(&choice.message));
+        for ((call_id, _), result) in searches.into_iter().zip(results) {
+            let content = result
+                .map_err(ProxyError::bad_gateway)?
+                .into_tool_content()
+                .map_err(ProxyError::bad_gateway)?;
+            request.messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: Some(content),
+                name: None,
+                tool_call_id: Some(call_id),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            });
+        }
+        request.tool_choice = None;
     }
+}
+
+fn assistant_message_for_follow_up(message: &ChatAssistantMessage) -> ChatMessage {
+    ChatMessage {
+        role: ChatRole::Assistant,
+        content: message.content.clone().or_else(|| message.refusal.clone()),
+        name: None,
+        tool_call_id: None,
+        tool_calls: message.tool_calls.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageAccumulator {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cached_tokens: u64,
+    reasoning_tokens: u64,
+    saw_usage: bool,
+}
+
+impl UsageAccumulator {
+    fn add(&mut self, usage: Option<&ChatUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        self.saw_usage = true;
+        add_optional(&mut self.prompt_tokens, usage.prompt_tokens);
+        add_optional(&mut self.completion_tokens, usage.completion_tokens);
+        add_optional(&mut self.total_tokens, usage.total_tokens);
+        self.cached_tokens += usage
+            .details
+            .get("prompt_tokens_details")
+            .and_then(|value| value.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.reasoning_tokens += usage
+            .details
+            .get("completion_tokens_details")
+            .and_then(|value| value.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    }
+
+    fn finish(&self) -> Option<ChatUsage> {
+        self.saw_usage.then(|| ChatUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            details: std::collections::BTreeMap::from([
+                (
+                    "prompt_tokens_details".to_owned(),
+                    json!({ "cached_tokens": self.cached_tokens }),
+                ),
+                (
+                    "completion_tokens_details".to_owned(),
+                    json!({ "reasoning_tokens": self.reasoning_tokens }),
+                ),
+            ]),
+        })
+    }
+}
+
+fn add_optional(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0) + value);
+    }
+}
+
+fn completion_to_responses_stream(
+    completion: ChatCompletionResponse,
+    requested_model: String,
+    tools: ToolRegistry,
+) -> Result<Response> {
+    let id = completion.id.clone();
+    let model = completion.model.clone();
+    let usage = completion.usage.clone();
+    let items = completion
+        .choices
+        .into_iter()
+        .map(|choice| ChatChunkChoice {
+            index: choice.index,
+            delta: ChatDelta {
+                role: choice.message.role,
+                content: choice.message.content,
+                reasoning_content: choice.message.reasoning_content,
+                reasoning: None,
+                refusal: choice.message.refusal,
+                tool_calls: choice
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ChatToolCallDelta {
+                        index,
+                        id: Some(call.id),
+                        kind: Some(call.kind),
+                        function: Some(ChatFunctionCallDelta {
+                            name: Some(call.function.name),
+                            arguments: Some(call.function.arguments),
+                        }),
+                    })
+                    .collect(),
+            },
+            finish_reason: choice.finish_reason,
+        })
+        .collect();
+    let chunk = ChatCompletionChunk {
+        id,
+        model,
+        choices: items,
+        usage,
+    };
+    let mut converter = ResponsesStreamConverter::new(requested_model, tools);
+    let mut body = String::new();
+    for item in [ChatStreamItem::Chunk(chunk), ChatStreamItem::Done] {
+        for event in converter.push(item)? {
+            body.push_str(&responses_sse_event(&event)?);
+        }
+    }
+    Ok(Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .expect("valid buffered Responses stream response"))
 }
 
 fn chat_stream_to_responses(
@@ -442,10 +689,30 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::{Json, Router};
+    use futures_util::future::BoxFuture;
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use url::Url;
+
+    #[derive(Clone, Default)]
+    struct FakeWebSearch {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WebSearchBackend for FakeWebSearch {
+        fn search(
+            &self,
+            request: WebSearchRequest,
+        ) -> BoxFuture<'static, Result<crate::web_search::WebSearchResult>> {
+            self.queries.lock().unwrap().push(request.query.clone());
+            Box::pin(async move {
+                Ok(crate::web_search::WebSearchResult {
+                    output: Value::String(format!("results for {}", request.query)),
+                })
+            })
+        }
+    }
 
     #[test]
     fn splits_only_the_provider_prefix() {
@@ -517,6 +784,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::Base,
+            web_search: None,
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -609,6 +877,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::Base,
+            web_search: None,
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -702,6 +971,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::Base,
+            web_search: None,
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -798,6 +1068,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::Base,
+            web_search: None,
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -894,6 +1165,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::Base,
+            web_search: Some(Arc::new(FakeWebSearch::default())),
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -924,6 +1196,278 @@ mod tests {
         assert!(body.contains("\"delta\":\"hello\""));
         assert!(body.contains("event: response.completed"));
         assert!(body.contains("\"total_tokens\":7"));
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn bridges_web_search_and_returns_buffered_responses_stream() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<Value>>>);
+
+        async fn upstream(State(capture): State<Capture>, Json(payload): Json<Value>) -> Response {
+            let mut requests = capture.0.lock().unwrap();
+            requests.push(payload);
+            let round = requests.len();
+            drop(requests);
+            if round == 1 {
+                Json(json!({
+                    "id": "chat-search-1",
+                    "model": "glm-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "search-call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                                    "arguments": "{\"query\":\"current Rust release\"}"
+                                }
+                            }, {
+                                "id": "search-call-2",
+                                "type": "function",
+                                "function": {
+                                    "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                                    "arguments": "{\"query\":\"Rust release date\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 2,
+                        "total_tokens": 6
+                    }
+                }))
+                .into_response()
+            } else {
+                Json(json!({
+                    "id": "chat-search-2",
+                    "model": "glm-test",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Rust search completed."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 3,
+                        "total_tokens": 11
+                    }
+                }))
+                .into_response()
+            }
+        }
+
+        let capture = Capture::default();
+        let upstream_app = Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(capture.clone());
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let config = chat_test_config(upstream_addr);
+        let backend = FakeWebSearch::default();
+        let router_state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+            web_search: Some(Arc::new(backend.clone())),
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "What is the current Rust release?",
+                "stream": true,
+                "tools": [{ "type": "web_search" }],
+                "tool_choice": { "type": "web_search" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("Rust search completed."));
+        assert!(body.contains("\"total_tokens\":17"));
+        assert_eq!(
+            backend.queries.lock().unwrap().as_slice(),
+            ["current Rust release", "Rust release date"]
+        );
+
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], false);
+        assert_eq!(
+            requests[0]["tools"][0]["function"]["name"],
+            INTERNAL_WEB_SEARCH_TOOL_NAME
+        );
+        assert_eq!(
+            requests[1]["messages"][1]["tool_calls"][0]["function"]["name"],
+            INTERNAL_WEB_SEARCH_TOOL_NAME
+        );
+        assert_eq!(requests[1]["messages"][2]["role"], "tool");
+        assert_eq!(requests[1]["messages"][2]["tool_call_id"], "search-call-1");
+        assert_eq!(
+            requests[1]["messages"][2]["content"],
+            "results for current Rust release"
+        );
+        assert_eq!(requests[1]["messages"][3]["tool_call_id"], "search-call-2");
+        assert_eq!(
+            requests[1]["messages"][3]["content"],
+            "results for Rust release date"
+        );
+        assert!(requests[1].get("tool_choice").is_none());
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_mixed_internal_and_external_tool_calls() {
+        async fn upstream() -> Response {
+            Json(json!({
+                "id": "chat-mixed",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "search-call",
+                                "type": "function",
+                                "function": {
+                                    "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                                    "arguments": "{\"query\":\"news\"}"
+                                }
+                            },
+                            {
+                                "id": "shell-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "shell",
+                                    "arguments": "{\"cmd\":\"pwd\"}"
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .into_response()
+        }
+
+        let upstream_app = Router::new().route("/v1/chat/completions", post(upstream));
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let backend = FakeWebSearch::default();
+        let router_state = AppState {
+            config: Arc::new(chat_test_config(upstream_addr)),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+            web_search: Some(Arc::new(backend.clone())),
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "search and run",
+                "tools": [
+                    { "type": "web_search" },
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let error: Value = response.json().await.unwrap();
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("same round"));
+        assert!(backend.queries.lock().unwrap().is_empty());
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn limits_web_search_to_eight_rounds() {
+        async fn upstream() -> Response {
+            Json(json!({
+                "id": "chat-loop",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "search-call",
+                            "type": "function",
+                            "function": {
+                                "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                                "arguments": "{\"query\":\"again\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .into_response()
+        }
+
+        let upstream_app = Router::new().route("/v1/chat/completions", post(upstream));
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let backend = FakeWebSearch::default();
+        let router_state = AppState {
+            config: Arc::new(chat_test_config(upstream_addr)),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+            web_search: Some(Arc::new(backend.clone())),
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "keep searching",
+                "tools": [{ "type": "web_search" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let error: Value = response.json().await.unwrap();
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maximum of 8"));
+        assert_eq!(backend.queries.lock().unwrap().len(), MAX_WEB_SEARCH_ROUNDS);
 
         router_task.abort();
         upstream_task.abort();
@@ -968,6 +1512,7 @@ mod tests {
             config: Arc::new(config),
             client: reqwest::Client::new(),
             mode: ServiceMode::OpenAiCompact,
+            web_search: None,
         };
         let router_app = Router::new()
             .route("/v1/*path", any(forward))
@@ -1014,5 +1559,23 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (address, task)
+    }
+
+    fn chat_test_config(upstream_addr: SocketAddr) -> Config {
+        Config {
+            providers: BTreeMap::from([(
+                "alpha".to_owned(),
+                ProviderConfig {
+                    base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    api_key: Some("upstream-secret".to_owned()),
+                    api_key_env: None,
+                    enabled: true,
+                    models: vec!["glm-test".to_owned()],
+                    chat_models: vec!["glm-test".to_owned()],
+                    remote_compaction_models: Vec::new(),
+                },
+            )]),
+            ..Config::default()
+        }
     }
 }

@@ -3,6 +3,7 @@ use crate::chat::{
     ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatRole, ChatStreamItem, ChatTool,
     ChatToolCall, ChatUsage,
 };
+use crate::web_search::{self, INTERNAL_WEB_SEARCH_TOOL_NAME};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -105,6 +106,13 @@ pub struct ConvertedChatRequest {
 }
 
 pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest> {
+    responses_request_to_chat_with_web_search(payload, false)
+}
+
+pub fn responses_request_to_chat_with_web_search(
+    payload: &Value,
+    web_search_enabled: bool,
+) -> Result<ConvertedChatRequest> {
     let object = payload
         .as_object()
         .context("Responses request must be a JSON object")?;
@@ -123,8 +131,19 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
     }
 
     let mut registry = ToolRegistry::default();
-    let mut tools = convert_tools(object.get("tools"), &mut registry)?;
-    tools.extend(convert_input_tools(object.get("input"), &mut registry)?);
+    let (mut tools, mut has_web_search) = convert_tools(object.get("tools"), &mut registry)?;
+    let (input_tools, input_has_web_search) =
+        convert_input_tools(object.get("input"), &mut registry)?;
+    tools.extend(input_tools);
+    has_web_search |= input_has_web_search;
+    if web_search_enabled && has_web_search {
+        if registry.kind(INTERNAL_WEB_SEARCH_TOOL_NAME).is_some() {
+            bail!(
+                "Responses tool name `{INTERNAL_WEB_SEARCH_TOOL_NAME}` is reserved for the Router Web Search bridge"
+            );
+        }
+        tools.push(web_search::chat_tool());
+    }
     if let Some(input) = object.get("input") {
         convert_input(input, &mut messages, &registry)?;
     } else {
@@ -132,7 +151,15 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
     }
     let mut request = ChatCompletionRequest::new(model, messages, stream);
     request.tools = tools;
-    request.tool_choice = convert_tool_choice(object.get("tool_choice"), &registry)?;
+    request.tool_choice = if request.tools.is_empty() {
+        None
+    } else {
+        convert_tool_choice(
+            object.get("tool_choice"),
+            &registry,
+            web_search_enabled && has_web_search,
+        )?
+    };
     request.parallel_tool_calls = optional_bool(object, "parallel_tool_calls")?;
     request.reasoning_effort = object
         .get("reasoning")
@@ -158,23 +185,26 @@ pub fn responses_request_to_chat(payload: &Value) -> Result<ConvertedChatRequest
 fn convert_input_tools(
     input: Option<&Value>,
     registry: &mut ToolRegistry,
-) -> Result<Vec<ChatTool>> {
+) -> Result<(Vec<ChatTool>, bool)> {
     let Some(Value::Array(items)) = input else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let mut converted = Vec::new();
+    let mut has_web_search = false;
     for item in items {
         let Some(object) = item.as_object() else {
             continue;
         };
         match object.get("type").and_then(Value::as_str) {
             Some("additional_tools") | Some("tool_search_output") => {
-                converted.extend(convert_tools(object.get("tools"), registry)?);
+                let (tools, includes_web_search) = convert_tools(object.get("tools"), registry)?;
+                converted.extend(tools);
+                has_web_search |= includes_web_search;
             }
             _ => {}
         }
     }
-    Ok(converted)
+    Ok((converted, has_web_search))
 }
 
 fn convert_input(
@@ -431,14 +461,18 @@ fn responses_content_to_chat(content: &Value) -> Result<Value> {
     }
 }
 
-fn convert_tools(tools: Option<&Value>, registry: &mut ToolRegistry) -> Result<Vec<ChatTool>> {
+fn convert_tools(
+    tools: Option<&Value>,
+    registry: &mut ToolRegistry,
+) -> Result<(Vec<ChatTool>, bool)> {
     let Some(tools) = tools else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let tools = tools
         .as_array()
         .context("Responses request `tools` must be an array")?;
     let mut converted = Vec::new();
+    let mut has_web_search = false;
     for tool in tools {
         let object = tool
             .as_object()
@@ -518,11 +552,11 @@ fn convert_tools(tools: Option<&Value>, registry: &mut ToolRegistry) -> Result<V
                     strict: None,
                 }));
             }
-            "web_search" => {}
+            "web_search" => has_web_search = true,
             unsupported => bail!("unsupported Responses tool type `{unsupported}`"),
         }
     }
-    Ok(converted)
+    Ok((converted, has_web_search))
 }
 
 fn optional_tool_description(object: &Map<String, Value>) -> Result<Option<String>> {
@@ -549,7 +583,11 @@ fn convert_function_tool(
     }))
 }
 
-fn convert_tool_choice(choice: Option<&Value>, registry: &ToolRegistry) -> Result<Option<Value>> {
+fn convert_tool_choice(
+    choice: Option<&Value>,
+    registry: &ToolRegistry,
+    web_search_enabled: bool,
+) -> Result<Option<Value>> {
     let Some(choice) = choice else {
         return Ok(None);
     };
@@ -575,6 +613,16 @@ fn convert_tool_choice(choice: Option<&Value>, registry: &ToolRegistry) -> Resul
                 "type": "function",
                 "function": { "name": name }
             })))
+        }
+        "web_search" => {
+            if web_search_enabled {
+                Ok(Some(json!({
+                    "type": "function",
+                    "function": { "name": INTERNAL_WEB_SEARCH_TOOL_NAME }
+                })))
+            } else {
+                Ok(None)
+            }
         }
         "allowed_tools" => bail!("Responses `allowed_tools` tool choice is not supported"),
         unsupported => bail!("unsupported Responses tool choice type `{unsupported}`"),
@@ -1891,6 +1939,90 @@ mod tests {
             converted.tools.kind("tool_search"),
             Some(ResponsesToolKind::ToolSearch)
         );
+    }
+
+    #[test]
+    fn exposes_hosted_web_search_as_reserved_chat_function_when_enabled() {
+        let converted = responses_request_to_chat_with_web_search(
+            &json!({
+                "model": "glm-test",
+                "input": "search",
+                "tools": [{ "type": "web_search", "external_web_access": true }],
+                "tool_choice": { "type": "web_search" }
+            }),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(converted.request.tools.len(), 1);
+        assert_eq!(
+            converted.request.tools[0].function.name,
+            INTERNAL_WEB_SEARCH_TOOL_NAME
+        );
+        assert_eq!(
+            converted.request.tool_choice,
+            Some(json!({
+                "type": "function",
+                "function": { "name": INTERNAL_WEB_SEARCH_TOOL_NAME }
+            }))
+        );
+    }
+
+    #[test]
+    fn explicit_web_search_choice_is_omitted_when_bridge_is_disabled() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "glm-test",
+            "input": "search",
+            "tools": [{ "type": "web_search" }],
+            "tool_choice": "required"
+        }))
+        .unwrap();
+
+        assert!(converted.request.tools.is_empty());
+        assert_eq!(converted.request.tool_choice, None);
+    }
+
+    #[test]
+    fn enables_web_search_discovered_in_additional_tools() {
+        let converted = responses_request_to_chat_with_web_search(
+            &json!({
+                "model": "glm-test",
+                "input": [{
+                    "type": "additional_tools",
+                    "tools": [{ "type": "web_search" }]
+                }]
+            }),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(converted.request.tools.len(), 1);
+        assert_eq!(
+            converted.request.tools[0].function.name,
+            INTERNAL_WEB_SEARCH_TOOL_NAME
+        );
+    }
+
+    #[test]
+    fn rejects_user_tool_colliding_with_reserved_web_search_name() {
+        let error = responses_request_to_chat_with_web_search(
+            &json!({
+                "model": "glm-test",
+                "input": "search",
+                "tools": [
+                    { "type": "web_search" },
+                    {
+                        "type": "function",
+                        "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                ]
+            }),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[test]

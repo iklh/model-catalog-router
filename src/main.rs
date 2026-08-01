@@ -6,6 +6,7 @@ mod interactive;
 mod proxy;
 pub mod responses;
 mod sync;
+mod web_search;
 
 use anyhow::{bail, Result};
 use clap::Parser;
