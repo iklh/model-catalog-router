@@ -22,6 +22,7 @@ base_url = "https://new-api.example.com/v1"
 api_key_env = "EXAMPLE_NEW_API_KEY"
 enabled = true
 models = ["gpt-5"]
+chat_models = []
 remote_compaction_models = []
 "#;
 
@@ -84,6 +85,8 @@ pub struct ProviderConfig {
     pub enabled: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub chat_models: Vec<String>,
     #[serde(default)]
     pub remote_compaction_models: Vec<String>,
 }
@@ -208,6 +211,20 @@ fn validate_provider(name: &str, provider: &ProviderConfig, resolve_key: bool) -
     }
     if provider.models.iter().any(|model| model.trim().is_empty()) {
         bail!("provider `{name}` contains an empty model name");
+    }
+    if provider
+        .chat_models
+        .iter()
+        .any(|model| model.trim().is_empty())
+    {
+        bail!("provider `{name}` contains an empty Chat model name");
+    }
+    if let Some(model) = provider
+        .chat_models
+        .iter()
+        .find(|model| !provider.models.contains(model))
+    {
+        bail!("provider `{name}` Chat model `{model}` is not present in models");
     }
     if provider
         .models
@@ -395,6 +412,7 @@ mod tests {
             api_key_env: None,
             enabled: true,
             models: vec!["gpt-test".into()],
+            chat_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         assert_eq!(
@@ -434,6 +452,7 @@ models = ["sol"]
         assert!(config.providers["example"]
             .remote_compaction_models
             .is_empty());
+        assert!(config.providers["example"].chat_models.is_empty());
     }
 
     #[test]
@@ -451,6 +470,7 @@ models = ["sol"]
             api_key_env: None,
             enabled: false,
             models: vec!["gpt-test".into()],
+            chat_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let config = Config {
@@ -469,7 +489,26 @@ models = ["sol"]
             api_key_env: None,
             enabled: true,
             models: vec!["sol".into()],
+            chat_models: Vec::new(),
             remote_compaction_models: vec!["terra".into()],
+        };
+        let config = Config {
+            providers: BTreeMap::from([("example".to_owned(), provider)]),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn chat_models_must_be_selected_base_models() {
+        let provider = ProviderConfig {
+            base_url: Url::parse("https://example.com/v1").unwrap(),
+            api_key: Some("secret".into()),
+            api_key_env: None,
+            enabled: true,
+            models: vec!["sol".into()],
+            chat_models: vec!["terra".into()],
+            remote_compaction_models: Vec::new(),
         };
         let config = Config {
             providers: BTreeMap::from([("example".to_owned(), provider)]),
@@ -486,6 +525,7 @@ models = ["sol"]
             api_key_env: None,
             enabled: true,
             models: vec!["sol".into()],
+            chat_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let mut config = Config {

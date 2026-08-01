@@ -384,6 +384,7 @@ mod tests {
             api_key_env: None,
             enabled: true,
             models: vec!["sol".into(), "terra".into()],
+            chat_models: Vec::new(),
             remote_compaction_models: vec!["sol".into()],
         };
         let config = Config {

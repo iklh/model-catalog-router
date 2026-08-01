@@ -270,6 +270,7 @@ mod tests {
                 api_key_env: None,
                 enabled: true,
                 models: vec!["gpt-test".to_owned()],
+                chat_models: Vec::new(),
                 remote_compaction_models: vec!["gpt-test".to_owned()],
             },
         );

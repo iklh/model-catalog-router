@@ -273,6 +273,9 @@ async fn provider_wizard(
         models: current
             .map(|provider| provider.models.clone())
             .unwrap_or_default(),
+        chat_models: current
+            .map(|provider| provider.chat_models.clone())
+            .unwrap_or_default(),
         remote_compaction_models: current
             .map(|provider| provider.remote_compaction_models.clone())
             .unwrap_or_default(),
@@ -287,6 +290,11 @@ async fn provider_wizard(
                         let current_models = current.map(|provider| provider.models.as_slice());
                         provider.models =
                             select_models(&discovered.models, current_models, current.is_none())?;
+                        provider.chat_models = select_chat_models(
+                            &provider.models,
+                            current_models,
+                            current.map(|provider| provider.chat_models.as_slice()),
+                        )?;
                         provider.remote_compaction_models = configure_remote_compaction(
                             &discovered,
                             &provider.models,
@@ -299,6 +307,11 @@ async fn provider_wizard(
                     }
                     DiscoveryOutcome::Manual => {
                         provider.models = manual_models()?;
+                        provider.chat_models = select_chat_models(
+                            &provider.models,
+                            current.map(|provider| provider.models.as_slice()),
+                            current.map(|provider| provider.chat_models.as_slice()),
+                        )?;
                         provider.remote_compaction_models.clear();
                         break;
                     }
@@ -307,8 +320,19 @@ async fn provider_wizard(
             }
         } else {
             provider.models = manual_models()?;
+            provider.chat_models = select_chat_models(
+                &provider.models,
+                current.map(|provider| provider.models.as_slice()),
+                current.map(|provider| provider.chat_models.as_slice()),
+            )?;
             provider.remote_compaction_models.clear();
         }
+    } else if prompt_yes_no("Change Chat compatibility selection", false)? {
+        provider.chat_models = select_chat_models(
+            &provider.models,
+            Some(&provider.models),
+            Some(&provider.chat_models),
+        )?;
     }
     if provider.models.is_empty() {
         bail!("at least one model must be selected");
@@ -420,6 +444,11 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
     if selected.is_empty() {
         bail!("at least one model must be selected");
     }
+    let chat_models = select_chat_models(
+        &selected,
+        Some(&provider.models),
+        Some(&provider.chat_models),
+    )?;
     let remote_compaction_models = configure_remote_compaction(
         &discovered,
         &selected,
@@ -427,6 +456,7 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
     )?;
     let mut updated = config.clone();
     provider.models = selected;
+    provider.chat_models = chat_models;
     provider.remote_compaction_models = remote_compaction_models;
     updated.providers.insert(name, provider);
     Ok(Some(updated))
@@ -522,6 +552,73 @@ fn select_models(
         .into_iter()
         .map(|index| discovered[index - 1].clone())
         .collect())
+}
+
+fn select_chat_models(
+    selected_models: &[String],
+    previous_models: Option<&[String]>,
+    previous_chat_models: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let previous_models = previous_models.unwrap_or_default();
+    let previous_chat_models = previous_chat_models.unwrap_or_default();
+    let default_indices =
+        default_chat_model_indices(selected_models, previous_models, previous_chat_models);
+
+    println!("\nChat compatibility models:\n");
+    for (index, model) in selected_models.iter().enumerate() {
+        println!(
+            "{:>3}) [{}] {}",
+            index + 1,
+            if default_indices.contains(&(index + 1)) {
+                "x"
+            } else {
+                " "
+            },
+            model
+        );
+    }
+    println!("\nModels marked [x] will use Chat Completions compatibility.");
+    println!("GPT, o-series, Codex, Claude, Gemini, and Grok model names are excluded by default.");
+    println!(
+        "Press Enter to keep the marked models, or enter a complete selection such as 1,3-5, all, or none."
+    );
+    let input = prompt("Select Chat models", Some("keep marked"))?;
+    let indices = if input.eq_ignore_ascii_case("none") {
+        Vec::new()
+    } else {
+        resolve_model_selection(&input, default_indices, selected_models.len())?
+    };
+    Ok(indices
+        .into_iter()
+        .map(|index| selected_models[index - 1].clone())
+        .collect())
+}
+
+fn default_chat_model_indices(
+    selected_models: &[String],
+    previous_models: &[String],
+    previous_chat_models: &[String],
+) -> Vec<usize> {
+    selected_models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            let selected = if previous_models.contains(model) {
+                previous_chat_models.contains(model)
+            } else {
+                recommend_chat_protocol(model)
+            };
+            selected.then_some(index + 1)
+        })
+        .collect()
+}
+
+fn recommend_chat_protocol(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let model = model.rsplit('/').next().unwrap_or(&model);
+    !["gpt", "o1", "o3", "o4", "codex", "claude", "gemini", "grok"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
 }
 
 fn resolve_model_selection(
@@ -664,6 +761,7 @@ fn print_provider_summary(name: &str, provider: &ProviderConfig) {
     println!("Base URL: {}", provider.base_url);
     println!("API key:  {}", credential_summary(provider));
     println!("Models:   {} selected", provider.models.len());
+    println!("Chat:     {} selected", provider.chat_models.len());
     println!(
         "Remote compaction: {} selected",
         provider.remote_compaction_models.len()
@@ -780,6 +878,43 @@ mod tests {
         assert_eq!(
             resolve_model_selection("all", vec![1, 3], 4).unwrap(),
             vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn recommends_chat_except_for_known_native_model_families() {
+        for model in [
+            "gpt-5",
+            "o3",
+            "o4-mini",
+            "codex-mini",
+            "claude-sonnet-4",
+            "gemini-2.5-pro",
+            "grok-4",
+            "openai/gpt-5",
+            "xai/grok-4",
+        ] {
+            assert!(!recommend_chat_protocol(model), "{model}");
+        }
+        for model in ["glm-4.5", "deepseek-v3", "qwen3-coder", "vendor/glm-4.5"] {
+            assert!(recommend_chat_protocol(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn preserves_existing_chat_choices_and_classifies_only_new_models() {
+        let selected = vec![
+            "glm-old".to_owned(),
+            "deepseek-old".to_owned(),
+            "glm-new".to_owned(),
+            "gpt-new".to_owned(),
+        ];
+        let previous = vec!["glm-old".to_owned(), "deepseek-old".to_owned()];
+        let previous_chat = vec!["deepseek-old".to_owned()];
+
+        assert_eq!(
+            default_chat_model_indices(&selected, &previous, &previous_chat),
+            vec![2, 3]
         );
     }
 }

@@ -384,6 +384,7 @@ mod tests {
                 api_key_env: None,
                 enabled: true,
                 models: vec!["org/model".to_owned()],
+                chat_models: Vec::new(),
                 remote_compaction_models: vec!["org/model".to_owned()],
             },
         );
@@ -460,6 +461,7 @@ mod tests {
             api_key_env: None,
             enabled: true,
             models: vec!["sol".to_owned(), "terra".to_owned()],
+            chat_models: Vec::new(),
             remote_compaction_models: vec!["sol".to_owned()],
         };
         let config = Config {

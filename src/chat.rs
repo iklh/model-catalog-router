@@ -687,6 +687,7 @@ data: [DONE]
             api_key_env: None,
             enabled: true,
             models: vec!["model-a".to_owned()],
+            chat_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let request = ChatCompletionRequest::new(
@@ -744,6 +745,7 @@ data: [DONE]
             api_key_env: None,
             enabled: true,
             models: vec!["model-a".to_owned()],
+            chat_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let request = ChatCompletionRequest::new(
