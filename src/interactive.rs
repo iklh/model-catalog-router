@@ -2,7 +2,7 @@ use crate::catalog::{
     configured_models, configured_openai_compact_models, discover_provider_models,
     DiscoveredProviderModels,
 };
-use crate::config::{validate_provider_name, Config, ProviderConfig};
+use crate::config::{validate_provider_name, Config, ProviderConfig, WebSearchConfig};
 use crate::sync;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
@@ -14,7 +14,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let mut config = Config::load_or_default(config_path)?;
     loop {
         print_menu(&config);
-        let choice = prompt("e/n/d/r/t/l/q> ", None)?.to_ascii_lowercase();
+        let choice = prompt("e/n/d/r/t/l/w/q> ", None)?.to_ascii_lowercase();
         if choice == "q" {
             return Ok(());
         }
@@ -24,13 +24,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
             "d" => delete_provider(&config),
             "r" => refresh_provider(&config).await,
             "t" => toggle_provider(&config),
+            "w" => configure_web_search(&config),
             "l" => {
                 show_provider_models(&config)?;
                 continue;
             }
             "" => continue,
             _ => {
-                println!("Unknown choice. Enter e, n, d, r, t, l, or q.");
+                println!("Unknown choice. Enter e, n, d, r, t, l, w, or q.");
                 continue;
             }
         };
@@ -111,13 +112,63 @@ fn print_menu(config: &Config) {
             );
         }
     }
+    println!(
+        "\nWeb Search MCP: {}",
+        config
+            .web_search
+            .as_ref()
+            .map(|web_search| web_search.mcp_url.as_str())
+            .unwrap_or("disabled")
+    );
     println!("\ne) Edit existing provider");
     println!("n) New provider");
     println!("d) Delete provider");
     println!("r) Refresh provider models");
     println!("t) Toggle provider enabled");
     println!("l) List provider models");
+    println!("w) Configure Web Search MCP");
     println!("q) Quit configuration\n");
+}
+
+fn configure_web_search(config: &Config) -> Result<Option<Config>> {
+    let enabled = prompt_yes_no(
+        "Enable Web Search through responses-websearch-mcp",
+        config.web_search.is_some(),
+    )?;
+    let mut updated = config.clone();
+    if !enabled {
+        updated.web_search = None;
+        println!("Web Search MCP will be disabled.");
+        return Ok(Some(updated));
+    }
+
+    let default_url = Url::parse("http://127.0.0.1:9091/mcp").expect("valid default MCP URL");
+    let current = config
+        .web_search
+        .as_ref()
+        .map(|web_search| &web_search.mcp_url)
+        .unwrap_or(&default_url);
+    let mcp_url = prompt_web_search_mcp_url(current)?;
+    updated.web_search = Some(WebSearchConfig { mcp_url });
+    Ok(Some(updated))
+}
+
+fn prompt_web_search_mcp_url(current: &Url) -> Result<Url> {
+    loop {
+        let input = prompt("Web Search MCP URL", Some(current.as_str()))?;
+        match Url::parse(&input) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.fragment().is_none() =>
+            {
+                return Ok(url);
+            }
+            _ => println!(
+                "Web Search MCP URL must be an http or https URL with a host and no fragment."
+            ),
+        }
+    }
 }
 
 fn show_provider_models(config: &Config) -> Result<()> {

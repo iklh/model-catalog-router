@@ -17,6 +17,10 @@ openai_compact_listen = "127.0.0.1:8788"
 separator = "/"
 context_window = 128000
 
+# Web Search is disabled unless this section is present.
+# [web_search]
+# mcp_url = "http://127.0.0.1:9091/mcp"
+
 [providers.example]
 base_url = "https://new-api.example.com/v1"
 api_key_env = "EXAMPLE_NEW_API_KEY"
@@ -33,6 +37,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub catalog: CatalogConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<WebSearchConfig>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
 }
@@ -71,6 +77,12 @@ impl Default for CatalogConfig {
             context_window: default_context_window(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    pub mcp_url: Url,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -157,6 +169,17 @@ impl Config {
         }
         if self.server.listen == self.server.openai_compact_listen {
             bail!("server.listen and server.openai_compact_listen must be different");
+        }
+        if let Some(web_search) = &self.web_search {
+            if !matches!(web_search.mcp_url.scheme(), "http" | "https") {
+                bail!("web_search.mcp_url must use http or https");
+            }
+            if web_search.mcp_url.host_str().is_none() {
+                bail!("web_search.mcp_url must contain a host");
+            }
+            if web_search.mcp_url.fragment().is_some() {
+                bail!("web_search.mcp_url must not contain a fragment");
+            }
         }
 
         let mut folded_names = HashSet::new();
@@ -453,6 +476,31 @@ models = ["sol"]
             .remote_compaction_models
             .is_empty());
         assert!(config.providers["example"].chat_models.is_empty());
+        assert!(config.web_search.is_none());
+    }
+
+    #[test]
+    fn web_search_mcp_is_optional_and_validates_its_url() {
+        let provider = ProviderConfig {
+            base_url: Url::parse("https://example.com/v1").unwrap(),
+            api_key: Some("secret".into()),
+            api_key_env: None,
+            enabled: true,
+            models: vec!["glm-test".into()],
+            chat_models: vec!["glm-test".into()],
+            remote_compaction_models: Vec::new(),
+        };
+        let mut config = Config {
+            web_search: Some(WebSearchConfig {
+                mcp_url: Url::parse("http://127.0.0.1:9091/mcp").unwrap(),
+            }),
+            providers: BTreeMap::from([("example".to_owned(), provider)]),
+            ..Config::default()
+        };
+        assert!(config.validate_for_save().is_ok());
+
+        config.web_search.as_mut().unwrap().mcp_url = Url::parse("ftp://127.0.0.1/mcp").unwrap();
+        assert!(config.validate_for_save().is_err());
     }
 
     #[test]

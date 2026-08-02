@@ -9,7 +9,8 @@ use crate::responses::{
     ResponsesStreamConverter, ToolRegistry,
 };
 use crate::web_search::{
-    WebSearchBackend, WebSearchRequest, INTERNAL_WEB_SEARCH_TOOL_NAME, MAX_WEB_SEARCH_ROUNDS,
+    McpWebSearchBackend, WebSearchBackend, WebSearchRequest, INTERNAL_WEB_SEARCH_TOOL_NAME,
+    MAX_WEB_SEARCH_ROUNDS,
 };
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
@@ -54,14 +55,18 @@ impl ServiceMode {
 
 pub async fn serve(config: Config) -> Result<()> {
     let listen = config.server.listen;
+    let web_search = connect_web_search(&config).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to listen on {listen}"))?;
     info!(%listen, mode = ServiceMode::Base.name(), "model catalog router started");
-    axum::serve(listener, build_router(config, ServiceMode::Base)?)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("router server failed")
+    axum::serve(
+        listener,
+        build_router(config, ServiceMode::Base, web_search)?,
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("router server failed")
 }
 
 pub async fn serve_openai_compact(config: Config) -> Result<()> {
@@ -75,10 +80,13 @@ pub async fn serve_openai_compact(config: Config) -> Result<()> {
         mode = ServiceMode::OpenAiCompact.name(),
         "model catalog router started"
     );
-    axum::serve(listener, build_router(config, ServiceMode::OpenAiCompact)?)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("OpenAI compact router server failed")
+    axum::serve(
+        listener,
+        build_router(config, ServiceMode::OpenAiCompact, None)?,
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("OpenAI compact router server failed")
 }
 
 pub async fn serve_all(config: Config) -> Result<()> {
@@ -91,8 +99,9 @@ pub async fn serve_all(config: Config) -> Result<()> {
     let compact_listener = tokio::net::TcpListener::bind(compact_listen)
         .await
         .with_context(|| format!("failed to listen on {compact_listen}"))?;
-    let base_app = build_router(config.clone(), ServiceMode::Base)?;
-    let compact_app = build_router(config, ServiceMode::OpenAiCompact)?;
+    let web_search = connect_web_search(&config).await?;
+    let base_app = build_router(config.clone(), ServiceMode::Base, web_search)?;
+    let compact_app = build_router(config, ServiceMode::OpenAiCompact, None)?;
 
     info!(
         listen = %base_listen,
@@ -128,7 +137,23 @@ pub async fn serve_all(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn build_router(config: Config, mode: ServiceMode) -> Result<Router> {
+async fn connect_web_search(config: &Config) -> Result<Option<Arc<dyn WebSearchBackend>>> {
+    let Some(web_search) = &config.web_search else {
+        return Ok(None);
+    };
+    let backend = McpWebSearchBackend::connect(&web_search.mcp_url).await?;
+    info!(
+        endpoint = %web_search.mcp_url,
+        "connected to Web Search MCP"
+    );
+    Ok(Some(Arc::new(backend)))
+}
+
+fn build_router(
+    config: Config,
+    mode: ServiceMode,
+    web_search: Option<Arc<dyn WebSearchBackend>>,
+) -> Result<Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -137,7 +162,7 @@ fn build_router(config: Config, mode: ServiceMode) -> Result<Router> {
         config: Arc::new(config),
         client,
         mode,
-        web_search: None,
+        web_search,
     };
     Ok(Router::new()
         .route("/health", get(health))
@@ -778,6 +803,7 @@ mod tests {
                 separator: "/".to_owned(),
                 context_window: 128_000,
             },
+            web_search: None,
             providers,
         };
         let router_state = AppState {
@@ -1506,6 +1532,7 @@ mod tests {
         let config = Config {
             server: ServerConfig::default(),
             catalog: CatalogConfig::default(),
+            web_search: None,
             providers: BTreeMap::from([("alpha".to_owned(), provider)]),
         };
         let router_state = AppState {

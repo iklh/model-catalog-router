@@ -78,6 +78,9 @@ openai_compact_listen = "127.0.0.1:8788"
 separator = "/"
 context_window = 128000
 
+[web_search]
+mcp_url = "http://127.0.0.1:9091/mcp"
+
 [providers.newapi-a]
 base_url = "https://newapi-a.example.com/v1"
 api_key_env = "NEWAPI_A_API_KEY"
@@ -94,6 +97,14 @@ remote_compaction_models = []
 ```
 
 `remote_compaction_models` always contains base model IDs, never suffixed aliases. It must be a subset of `models`. Both listen addresses must be distinct loopback addresses.
+
+The optional `[web_search]` section enables Web Search for Chat compatibility
+models through the separate `responses-websearch-mcp` service. It is disabled
+when the section is absent. The interactive `config` command can enable,
+disable, or change the MCP URL. Start `responses-websearch-mcp` before starting
+the base Router service; an enabled Router fails to start if it cannot connect
+or if the MCP server does not expose the `web_search` tool. The
+OpenAI-compact-only service does not connect to Web Search MCP.
 
 For environment-backed keys, create `~/.config/model-catalog-router/.env` or export the variable before starting the Router:
 
