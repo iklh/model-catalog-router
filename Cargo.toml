@@ -2,7 +2,7 @@
 name = "model-catalog-router"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Route Codex model catalog entries to multiple OpenAI-compatible providers"
 license = "MIT"
 

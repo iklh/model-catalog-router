@@ -11,10 +11,11 @@ Router models always include a Provider prefix. The dedicated Codex profile keep
 
 ## Requirements
 
-Debian 13's packaged Rust 1.85 toolchain is supported:
+Rust 1.88 or newer is required. Debian 13's base Rust 1.85 packages are too old;
+after enabling `trixie-backports`, install the backported toolchain:
 
 ```bash
-sudo apt install cargo rustc
+sudo apt install -t trixie-backports cargo rustc
 cargo install --locked --path . --root ~/.local --force
 ```
 
