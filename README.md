@@ -98,13 +98,24 @@ remote_compaction_models = []
 
 `remote_compaction_models` always contains base model IDs, never suffixed aliases. It must be a subset of `models`. Both listen addresses must be distinct loopback addresses.
 
-The optional `[web_search]` section enables Web Search for Chat compatibility
-models through the separate `responses-websearch-mcp` service. It is disabled
-when the section is absent. The interactive `config` command can enable,
-disable, or change the MCP URL. Start `responses-websearch-mcp` before starting
-the base Router service; an enabled Router fails to start if it cannot connect
-or if the MCP server does not expose the `web_search` tool. The
-OpenAI-compact-only service does not connect to Web Search MCP.
+The optional `[web_search]` section stores the MCP URL for Web Search used by
+Chat compatibility models through the separate `responses-websearch-mcp`
+service. It does not enable Web Search by itself. Enable Web Search for a
+runtime with `serve --web-search` or `serve-all --web-search`. The interactive
+`config` command only configures or changes the MCP URL.
+
+When Web Search is enabled, the URL is selected in this order:
+
+1. The command-line `--web-search-url` override.
+2. `[web_search].mcp_url` from the configuration file.
+3. The default `http://127.0.0.1:9091/mcp`.
+
+`--web-search-url` requires `--web-search`, applies only to the current
+runtime, and does not update the configuration file. Start
+`responses-websearch-mcp` before starting the base Router service; an enabled
+Router fails to start if it cannot connect or if the MCP server does not
+expose the `web_search` tool. The OpenAI-compact-only service does not connect
+to Web Search MCP.
 
 For environment-backed keys, create `~/.config/model-catalog-router/.env` or export the variable before starting the Router:
 
@@ -121,6 +132,24 @@ Start the Router:
 ```bash
 model-catalog-router serve
 ```
+
+To enable Web Search for Chat compatibility models:
+
+```bash
+model-catalog-router serve --web-search
+```
+
+To temporarily override the configured Web Search MCP URL:
+
+```bash
+model-catalog-router serve \
+  --web-search \
+  --web-search-url http://127.0.0.1:9092/mcp
+```
+
+The `--web-search-url` option is valid only together with `--web-search`.
+Without `--web-search`, Web Search remains disabled even when
+`[web_search].mcp_url` is present in the configuration file.
 
 Start Codex with its isolated Router profile:
 
@@ -156,6 +185,15 @@ Start both listeners atomically in one foreground process with:
 ```bash
 model-catalog-router serve-all
 ```
+
+Web Search can also be enabled when starting both listeners:
+
+```bash
+model-catalog-router serve-all --web-search
+```
+
+The same `--web-search-url` override is available for `serve-all` and must be
+used together with `--web-search`.
 
 `serve-all` binds both addresses before serving either one, and one Ctrl+C stops both. It fails clearly when no remote-compaction models are configured. The separate `serve` and `serve-openai-compact` commands can instead be run as independent processes so that either service can be started or stopped without affecting the other. Switching profiles requires exiting Codex and launching it again with the desired `-p` option.
 
@@ -257,9 +295,9 @@ model-catalog-router check [TARGET]
 model-catalog-router listmodels [--json]
 model-catalog-router listproviders
 model-catalog-router regenerate [--output PATH]
-model-catalog-router serve [--listen ADDRESS]
+model-catalog-router serve [--listen ADDRESS] [--web-search] [--web-search-url URL]
 model-catalog-router serve-openai-compact [--listen ADDRESS]
-model-catalog-router serve-all [--listen ADDRESS] [--openai-compact-listen ADDRESS]
+model-catalog-router serve-all [--listen ADDRESS] [--openai-compact-listen ADDRESS] [--web-search] [--web-search-url URL]
 model-catalog-router init [--force]
 ```
 
@@ -285,6 +323,7 @@ Model targets use `catalog.separator` (the default is `/`) and split only at its
 - Routes selected models through OpenAI-compatible JSON endpoints under `/v1/*`.
 - Replaces namespaced model names and upstream bearer tokens per request.
 - Uses a separate compact listener/profile/catalog and rewrites only `/responses/compact` requests to matching `-openai-compact` aliases.
+- Optionally bridges Web Search for Chat compatibility models through a separately configured `responses-websearch-mcp` service when enabled with `--web-search`.
 - Streams upstream response bodies without buffering, including Responses API SSE.
 - Allows only loopback listeners and requires no local API key.
 - Inherits supported reasoning levels from Codex's model cache when an upstream model ID matches a Codex model slug, preferring the Router's `medium` default when supported; unmatched models keep conservative capability metadata because standard `/v1/models` responses do not describe reasoning features.
