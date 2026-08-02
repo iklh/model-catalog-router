@@ -2,7 +2,10 @@ use crate::catalog::{
     configured_models, configured_openai_compact_models, discover_provider_models,
     DiscoveredProviderModels,
 };
-use crate::config::{validate_provider_name, Config, ProviderConfig, WebSearchConfig};
+use crate::config::{
+    default_web_search_mcp_url, validate_provider_name, validate_web_search_mcp_url, Config,
+    ProviderConfig, WebSearchConfig,
+};
 use crate::sync;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
@@ -113,12 +116,12 @@ fn print_menu(config: &Config) {
         }
     }
     println!(
-        "\nWeb Search MCP: {}",
+        "\nWeb Search MCP URL: {}",
         config
             .web_search
             .as_ref()
             .map(|web_search| web_search.mcp_url.as_str())
-            .unwrap_or("disabled")
+            .unwrap_or("http://127.0.0.1:9091/mcp (default)")
     );
     println!("\ne) Edit existing provider");
     println!("n) New provider");
@@ -126,23 +129,13 @@ fn print_menu(config: &Config) {
     println!("r) Refresh provider models");
     println!("t) Toggle provider enabled");
     println!("l) List provider models");
-    println!("w) Configure Web Search MCP");
+    println!("w) Configure Web Search MCP URL");
     println!("q) Quit configuration\n");
 }
 
 fn configure_web_search(config: &Config) -> Result<Option<Config>> {
-    let enabled = prompt_yes_no(
-        "Enable Web Search through responses-websearch-mcp",
-        config.web_search.is_some(),
-    )?;
     let mut updated = config.clone();
-    if !enabled {
-        updated.web_search = None;
-        println!("Web Search MCP will be disabled.");
-        return Ok(Some(updated));
-    }
-
-    let default_url = Url::parse("http://127.0.0.1:9091/mcp").expect("valid default MCP URL");
+    let default_url = default_web_search_mcp_url();
     let current = config
         .web_search
         .as_ref()
@@ -157,13 +150,7 @@ fn prompt_web_search_mcp_url(current: &Url) -> Result<Url> {
     loop {
         let input = prompt("Web Search MCP URL", Some(current.as_str()))?;
         match Url::parse(&input) {
-            Ok(url)
-                if matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.fragment().is_none() =>
-            {
-                return Ok(url);
-            }
+            Ok(url) if validate_web_search_mcp_url(&url).is_ok() => return Ok(url),
             _ => println!(
                 "Web Search MCP URL must be an http or https URL with a host and no fragment."
             ),

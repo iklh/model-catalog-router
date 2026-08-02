@@ -1,7 +1,7 @@
 use crate::chat::{
-    ChatAssistantMessage, ChatChunkChoice, ChatClient, ChatCompletionChunk, ChatCompletionResponse,
-    ChatDelta, ChatFunctionCallDelta, ChatMessage, ChatResponse, ChatRole, ChatStream,
-    ChatStreamItem, ChatToolCallDelta, ChatUsage,
+    ChatAssistantMessage, ChatChunkChoice, ChatClient, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, ChatDelta, ChatFunctionCallDelta, ChatMessage, ChatResponse, ChatRole,
+    ChatStream, ChatStreamItem, ChatToolCallDelta, ChatUsage,
 };
 use crate::config::{Config, ProviderConfig};
 use crate::responses::{
@@ -26,9 +26,10 @@ use futures_util::{future::join_all, stream, TryStreamExt};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{error, info};
+use url::Url;
 
 #[derive(Clone)]
 struct AppState {
@@ -53,9 +54,9 @@ impl ServiceMode {
     }
 }
 
-pub async fn serve(config: Config) -> Result<()> {
+pub async fn serve(config: Config, web_search_url: Option<Url>) -> Result<()> {
     let listen = config.server.listen;
-    let web_search = connect_web_search(&config).await?;
+    let web_search = connect_web_search(web_search_url.as_ref()).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to listen on {listen}"))?;
@@ -89,7 +90,7 @@ pub async fn serve_openai_compact(config: Config) -> Result<()> {
     .context("OpenAI compact router server failed")
 }
 
-pub async fn serve_all(config: Config) -> Result<()> {
+pub async fn serve_all(config: Config, web_search_url: Option<Url>) -> Result<()> {
     ensure_openai_compact_models(&config)?;
     let base_listen = config.server.listen;
     let compact_listen = config.server.openai_compact_listen;
@@ -99,7 +100,7 @@ pub async fn serve_all(config: Config) -> Result<()> {
     let compact_listener = tokio::net::TcpListener::bind(compact_listen)
         .await
         .with_context(|| format!("failed to listen on {compact_listen}"))?;
-    let web_search = connect_web_search(&config).await?;
+    let web_search = connect_web_search(web_search_url.as_ref()).await?;
     let base_app = build_router(config.clone(), ServiceMode::Base, web_search)?;
     let compact_app = build_router(config, ServiceMode::OpenAiCompact, None)?;
 
@@ -137,15 +138,12 @@ pub async fn serve_all(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn connect_web_search(config: &Config) -> Result<Option<Arc<dyn WebSearchBackend>>> {
-    let Some(web_search) = &config.web_search else {
+async fn connect_web_search(endpoint: Option<&Url>) -> Result<Option<Arc<dyn WebSearchBackend>>> {
+    let Some(endpoint) = endpoint else {
         return Ok(None);
     };
-    let backend = McpWebSearchBackend::connect(&web_search.mcp_url).await?;
-    info!(
-        endpoint = %web_search.mcp_url,
-        "connected to Web Search MCP"
-    );
+    let backend = McpWebSearchBackend::connect(endpoint).await?;
+    info!(%endpoint, "connected to Web Search MCP");
     Ok(Some(Arc::new(backend)))
 }
 
@@ -346,29 +344,113 @@ async fn forward_responses_via_chat(
     };
 
     let original_stream = converted.request.stream;
-    let mut request = converted.request;
-    request.stream = false;
-    request.stream_options = None;
+    let request = converted.request;
+    let tools = converted.tools;
     let chat_client = ChatClient::from_client(client.clone());
+
+    if original_stream {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut stream = WebSearchResponsesStream::new(requested_model.clone(), tools, sender);
+        let started = stream.converter.start();
+        stream
+            .send_events(started)
+            .map_err(ProxyError::bad_gateway)?;
+        let provider_name = provider_name.to_owned();
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            let result = run_web_search_bridge(
+                &chat_client,
+                &provider_name,
+                &provider,
+                &requested_model,
+                request,
+                web_search,
+                Some(&mut stream),
+            )
+            .await;
+            match result {
+                Ok(completion) => {
+                    if let Err(error) = stream.complete(completion) {
+                        error!(
+                            provider = provider_name,
+                            model = requested_model,
+                            %error,
+                            "failed to complete streamed Web Search bridge response"
+                        );
+                    }
+                }
+                Err(bridge_error) => {
+                    let bridge_error = format!("{bridge_error:#}");
+                    error!(
+                        provider = provider_name,
+                        model = requested_model,
+                        error = %bridge_error,
+                        "Web Search bridge failed"
+                    );
+                    let _ = stream.fail(bridge_error);
+                }
+            }
+        });
+        return Ok(web_search_stream_response(receiver));
+    }
+
+    let completion = run_web_search_bridge(
+        &chat_client,
+        provider_name,
+        provider,
+        &requested_model,
+        request,
+        web_search,
+        None,
+    )
+    .await
+    .map_err(|error| ProxyError::bad_gateway(format!("{error:#}")))?;
+    let response = chat_completion_to_responses(&completion, &requested_model, &tools)
+        .map_err(ProxyError::bad_gateway)?;
+    Ok(Json(response).into_response())
+}
+
+async fn run_web_search_bridge(
+    chat_client: &ChatClient,
+    provider_name: &str,
+    provider: &ProviderConfig,
+    requested_model: &str,
+    mut request: ChatCompletionRequest,
+    web_search: Arc<dyn WebSearchBackend>,
+    mut stream: Option<&mut WebSearchResponsesStream>,
+) -> Result<ChatCompletionResponse> {
     let mut search_rounds = 0;
     let mut usage = UsageAccumulator::default();
 
     loop {
+        let round = search_rounds + 1;
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            round,
+            "starting Chat round for Web Search bridge"
+        );
         let mut completion = chat_client
             .send(provider_name, provider, &request)
             .await
-            .map_err(ProxyError::bad_gateway)?
-            .into_completion(&requested_model)
+            .with_context(|| format!("Chat round {round} request failed"))?
+            .into_completion(requested_model)
             .await
-            .map_err(ProxyError::bad_gateway)?;
+            .with_context(|| format!("Chat round {round} response failed"))?;
         usage.add(completion.usage.as_ref());
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            round,
+            "Chat round completed for Web Search bridge"
+        );
 
         let choice = completion
             .choices
             .iter()
             .find(|choice| choice.index == 0)
             .or_else(|| completion.choices.first())
-            .ok_or_else(|| ProxyError::bad_gateway("Chat completion contained no choices"))?;
+            .context("Chat completion contained no choices")?;
         let internal_calls = choice
             .message
             .tool_calls
@@ -383,26 +465,15 @@ async fn forward_responses_via_chat(
 
         if internal_calls.is_empty() {
             completion.usage = usage.finish();
-            return if original_stream {
-                completion_to_responses_stream(completion, requested_model, converted.tools)
-                    .map_err(ProxyError::bad_gateway)
-            } else {
-                let response =
-                    chat_completion_to_responses(&completion, &requested_model, &converted.tools)
-                        .map_err(ProxyError::bad_gateway)?;
-                Ok(Json(response).into_response())
-            };
+            return Ok(completion);
         }
-
         if has_external_calls {
-            return Err(ProxyError::bad_gateway(
-                "Chat model returned Router Web Search and external tool calls in the same round",
-            ));
+            bail!(
+                "Chat model returned Router Web Search and external tool calls in the same round"
+            );
         }
         if search_rounds == MAX_WEB_SEARCH_ROUNDS {
-            return Err(ProxyError::bad_gateway(format!(
-                "Chat model exceeded the maximum of {MAX_WEB_SEARCH_ROUNDS} Web Search rounds"
-            )));
+            bail!("Chat model exceeded the maximum of {MAX_WEB_SEARCH_ROUNDS} Web Search rounds");
         }
         search_rounds += 1;
 
@@ -413,22 +484,60 @@ async fn forward_responses_via_chat(
                     .map(|search| (call.id.clone(), search))
             })
             .collect::<Result<Vec<_>>>()
-            .map_err(ProxyError::bad_gateway)?;
+            .context("failed to decode Chat Web Search tool calls")?;
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            round = search_rounds,
+            search_count = searches.len(),
+            "Chat model requested Web Search"
+        );
+        let handles = if let Some(stream) = stream.as_deref_mut() {
+            Some(
+                searches
+                    .iter()
+                    .map(|(_, search)| stream.start_search(&search.query))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            round = search_rounds,
+            search_count = searches.len(),
+            "starting Web Search MCP calls"
+        );
         let results = join_all(
             searches
                 .iter()
                 .map(|(_, search)| web_search.search(search.clone())),
         )
-        .await;
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .context("Web Search MCP calls failed")?;
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            round = search_rounds,
+            search_count = results.len(),
+            "Web Search MCP calls completed"
+        );
+        if let (Some(stream), Some(handles)) = (stream.as_deref_mut(), handles) {
+            for (handle, result) in handles.into_iter().zip(&results) {
+                stream.complete_search(handle, &result.output)?;
+            }
+        }
 
         request
             .messages
             .push(assistant_message_for_follow_up(&choice.message));
         for ((call_id, _), result) in searches.into_iter().zip(results) {
             let content = result
-                .map_err(ProxyError::bad_gateway)?
                 .into_tool_content()
-                .map_err(ProxyError::bad_gateway)?;
+                .context("failed to encode Web Search result for Chat follow-up")?;
             request.messages.push(ChatMessage {
                 role: ChatRole::Tool,
                 content: Some(content),
@@ -439,6 +548,12 @@ async fn forward_responses_via_chat(
             });
         }
         request.tool_choice = None;
+        info!(
+            provider = provider_name,
+            model = requested_model,
+            next_round = search_rounds + 1,
+            "starting Chat follow-up after Web Search"
+        );
     }
 }
 
@@ -511,11 +626,76 @@ fn add_optional(total: &mut Option<u64>, value: Option<u64>) {
     }
 }
 
-fn completion_to_responses_stream(
-    completion: ChatCompletionResponse,
-    requested_model: String,
-    tools: ToolRegistry,
-) -> Result<Response> {
+struct WebSearchResponsesStream {
+    converter: ResponsesStreamConverter,
+    sender: mpsc::UnboundedSender<Bytes>,
+}
+
+impl WebSearchResponsesStream {
+    fn new(
+        requested_model: String,
+        tools: ToolRegistry,
+        sender: mpsc::UnboundedSender<Bytes>,
+    ) -> Self {
+        Self {
+            converter: ResponsesStreamConverter::new(requested_model, tools),
+            sender,
+        }
+    }
+
+    fn start_search(&mut self, query: &str) -> Result<crate::responses::ResponsesWebSearchHandle> {
+        let (handle, events) = self.converter.start_web_search(query);
+        self.send_events(events)?;
+        Ok(handle)
+    }
+
+    fn complete_search(
+        &mut self,
+        handle: crate::responses::ResponsesWebSearchHandle,
+        result: &Value,
+    ) -> Result<()> {
+        let events = self.converter.complete_web_search(handle, result);
+        self.send_events(events)
+    }
+
+    fn complete(&mut self, completion: ChatCompletionResponse) -> Result<()> {
+        for item in completion_stream_items(completion) {
+            let events = self.converter.push(item)?;
+            self.send_events(events)?;
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, message: String) -> Result<()> {
+        let events = self.converter.fail(message);
+        self.send_events(events)
+    }
+
+    fn send_events(&self, events: Vec<Value>) -> Result<()> {
+        for event in events {
+            let serialized = responses_sse_event(&event)?;
+            self.sender
+                .send(Bytes::from(serialized))
+                .context("Responses stream client disconnected")?;
+        }
+        Ok(())
+    }
+}
+
+fn web_search_stream_response(receiver: mpsc::UnboundedReceiver<Bytes>) -> Response {
+    let body_stream = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, std::io::Error>(bytes), receiver))
+    });
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(body_stream))
+        .expect("valid Web Search Responses stream response")
+}
+
+fn completion_stream_items(completion: ChatCompletionResponse) -> Vec<ChatStreamItem> {
     let id = completion.id.clone();
     let model = completion.model.clone();
     let usage = completion.usage.clone();
@@ -555,17 +735,7 @@ fn completion_to_responses_stream(
         choices: items,
         usage,
     };
-    let mut converter = ResponsesStreamConverter::new(requested_model, tools);
-    let mut body = String::new();
-    for item in [ChatStreamItem::Chunk(chunk), ChatStreamItem::Done] {
-        for event in converter.push(item)? {
-            body.push_str(&responses_sse_event(&event)?);
-        }
-    }
-    Ok(Response::builder()
-        .header(CONTENT_TYPE, "text/event-stream")
-        .body(Body::from(body))
-        .expect("valid buffered Responses stream response"))
+    vec![ChatStreamItem::Chunk(chunk), ChatStreamItem::Done]
 }
 
 fn chat_stream_to_responses(
@@ -701,6 +871,11 @@ impl ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        error!(
+            status = %self.status,
+            message = %self.message,
+            "Router request failed"
+        );
         let body = Json(json!({ "error": { "message": self.message, "type": "router_error" } }));
         (self.status, body).into_response()
     }
@@ -736,6 +911,18 @@ mod tests {
                     output: Value::String(format!("results for {}", request.query)),
                 })
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingWebSearch;
+
+    impl WebSearchBackend for FailingWebSearch {
+        fn search(
+            &self,
+            _request: WebSearchRequest,
+        ) -> BoxFuture<'static, Result<crate::web_search::WebSearchResult>> {
+            Box::pin(async { Err(anyhow::anyhow!("synthetic MCP failure")) })
         }
     }
 
@@ -1228,7 +1415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridges_web_search_and_returns_buffered_responses_stream() {
+    async fn bridges_web_search_and_streams_search_status() {
         #[derive(Clone, Default)]
         struct Capture(Arc<Mutex<Vec<Value>>>);
 
@@ -1237,15 +1424,16 @@ mod tests {
             requests.push(payload);
             let round = requests.len();
             drop(requests);
-            if round == 1 {
-                Json(json!({
+            let event = if round == 1 {
+                json!({
                     "id": "chat-search-1",
                     "model": "glm-test",
                     "choices": [{
                         "index": 0,
-                        "message": {
+                        "delta": {
                             "role": "assistant",
                             "tool_calls": [{
+                                "index": 0,
                                 "id": "search-call-1",
                                 "type": "function",
                                 "function": {
@@ -1253,6 +1441,7 @@ mod tests {
                                     "arguments": "{\"query\":\"current Rust release\"}"
                                 }
                             }, {
+                                "index": 1,
                                 "id": "search-call-2",
                                 "type": "function",
                                 "function": {
@@ -1268,15 +1457,14 @@ mod tests {
                         "completion_tokens": 2,
                         "total_tokens": 6
                     }
-                }))
-                .into_response()
+                })
             } else {
-                Json(json!({
+                json!({
                     "id": "chat-search-2",
                     "model": "glm-test",
                     "choices": [{
                         "index": 0,
-                        "message": {
+                        "delta": {
                             "role": "assistant",
                             "content": "Rust search completed."
                         },
@@ -1287,9 +1475,12 @@ mod tests {
                         "completion_tokens": 3,
                         "total_tokens": 11
                     }
-                }))
-                .into_response()
-            }
+                })
+            };
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
+                .unwrap()
         }
 
         let capture = Capture::default();
@@ -1324,9 +1515,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.unwrap();
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.web_search_call.in_progress"));
+        assert!(body.contains("event: response.web_search_call.searching"));
+        assert!(body.contains("event: response.web_search_call.completed"));
         assert!(body.contains("event: response.output_text.delta"));
         assert!(body.contains("Rust search completed."));
         assert!(body.contains("\"total_tokens\":17"));
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.windows(2).all(|pair| {
+            pair[0]["sequence_number"].as_u64().unwrap() + 1
+                == pair[1]["sequence_number"].as_u64().unwrap()
+        }));
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "web_search_call");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[0]["action"]["query"], "current Rust release");
+        assert_eq!(output[1]["type"], "web_search_call");
+        assert_eq!(output[1]["action"]["query"], "Rust release date");
+        assert_eq!(output[2]["type"], "message");
         assert_eq!(
             backend.queries.lock().unwrap().as_slice(),
             ["current Rust release", "Rust release date"]
@@ -1334,7 +1550,10 @@ mod tests {
 
         let requests = capture.0.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["stream"], false);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[0]["stream_options"]["include_usage"], true);
+        assert_eq!(requests[1]["stream"], true);
+        assert_eq!(requests[1]["stream_options"]["include_usage"], true);
         assert_eq!(
             requests[0]["tools"][0]["function"]["name"],
             INTERNAL_WEB_SEARCH_TOOL_NAME
@@ -1355,6 +1574,83 @@ mod tests {
             "results for Rust release date"
         );
         assert!(requests[1].get("tool_choice").is_none());
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reports_web_search_failures_inside_stream_and_as_non_stream_502() {
+        async fn upstream() -> Response {
+            Json(json!({
+                "id": "chat-search-failure",
+                "model": "glm-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "search-call",
+                            "type": "function",
+                            "function": {
+                                "name": INTERNAL_WEB_SEARCH_TOOL_NAME,
+                                "arguments": "{\"query\":\"latest news\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .into_response()
+        }
+
+        let upstream_app = Router::new().route("/v1/chat/completions", post(upstream));
+        let (upstream_addr, upstream_task) = spawn(upstream_app).await;
+        let router_state = AppState {
+            config: Arc::new(chat_test_config(upstream_addr)),
+            client: reqwest::Client::new(),
+            mode: ServiceMode::Base,
+            web_search: Some(Arc::new(FailingWebSearch)),
+        };
+        let router_app = Router::new()
+            .route("/v1/*path", any(forward))
+            .with_state(router_state);
+        let (router_addr, router_task) = spawn(router_app).await;
+        let client = reqwest::Client::new();
+
+        let streamed = client
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "search",
+                "stream": true,
+                "tools": [{ "type": "web_search" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let body = streamed.text().await.unwrap();
+        assert!(body.contains("event: response.web_search_call.searching"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("synthetic MCP failure"));
+
+        let non_streamed = client
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({
+                "model": "alpha/glm-test",
+                "input": "search",
+                "tools": [{ "type": "web_search" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(non_streamed.status(), StatusCode::BAD_GATEWAY);
+        let error: Value = non_streamed.json().await.unwrap();
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic MCP failure"));
 
         router_task.abort();
         upstream_task.abort();

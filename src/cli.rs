@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use url::Url;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -49,6 +50,12 @@ pub enum Command {
         /// Override server.listen from config.toml.
         #[arg(long)]
         listen: Option<SocketAddr>,
+        /// Enable the Web Search MCP bridge for this run.
+        #[arg(long)]
+        web_search: bool,
+        /// Override the configured Web Search MCP URL for this run.
+        #[arg(long, requires = "web_search")]
+        web_search_url: Option<Url>,
     },
     /// Start only the OpenAI remote-compaction router.
     ServeOpenaiCompact {
@@ -64,6 +71,12 @@ pub enum Command {
         /// Override server.openai_compact_listen from config.toml.
         #[arg(long)]
         openai_compact_listen: Option<SocketAddr>,
+        /// Enable the Web Search MCP bridge for the base router.
+        #[arg(long)]
+        web_search: bool,
+        /// Override the configured Web Search MCP URL for this run.
+        #[arg(long, requires = "web_search")]
+        web_search_url: Option<Url>,
     },
 }
 
@@ -129,8 +142,38 @@ mod tests {
             all.command,
             Command::ServeAll {
                 listen: Some(_),
-                openai_compact_listen: Some(_)
+                openai_compact_listen: Some(_),
+                web_search: false,
+                web_search_url: None
             }
         ));
+    }
+
+    #[test]
+    fn web_search_url_requires_web_search_switch() {
+        let serve = Cli::try_parse_from([
+            "model-catalog-router",
+            "serve",
+            "--web-search",
+            "--web-search-url",
+            "http://127.0.0.1:9092/mcp",
+        ])
+        .unwrap();
+        assert!(matches!(
+            serve.command,
+            Command::Serve {
+                web_search: true,
+                web_search_url: Some(_),
+                ..
+            }
+        ));
+
+        assert!(Cli::try_parse_from([
+            "model-catalog-router",
+            "serve",
+            "--web-search-url",
+            "http://127.0.0.1:9092/mcp",
+        ])
+        .is_err());
     }
 }

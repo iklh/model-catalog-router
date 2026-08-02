@@ -88,13 +88,18 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Serve { listen } => {
+        Command::Serve {
+            listen,
+            web_search,
+            web_search_url,
+        } => {
             let mut loaded = config::Config::load(&config_path)?;
             if let Some(listen) = listen {
                 loaded.server.listen = listen;
             }
             loaded.validate()?;
-            proxy::serve(loaded).await
+            let web_search_url = resolve_web_search_url(&loaded, web_search, web_search_url)?;
+            proxy::serve(loaded, web_search_url).await
         }
         Command::ServeOpenaiCompact { listen } => {
             let mut loaded = config::Config::load(&config_path)?;
@@ -107,6 +112,8 @@ async fn main() -> Result<()> {
         Command::ServeAll {
             listen,
             openai_compact_listen,
+            web_search,
+            web_search_url,
         } => {
             let mut loaded = config::Config::load(&config_path)?;
             if let Some(listen) = listen {
@@ -116,9 +123,23 @@ async fn main() -> Result<()> {
                 loaded.server.openai_compact_listen = listen;
             }
             loaded.validate()?;
-            proxy::serve_all(loaded).await
+            let web_search_url = resolve_web_search_url(&loaded, web_search, web_search_url)?;
+            proxy::serve_all(loaded, web_search_url).await
         }
     }
+}
+
+fn resolve_web_search_url(
+    config: &config::Config,
+    enabled: bool,
+    override_url: Option<url::Url>,
+) -> Result<Option<url::Url>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let url = override_url.unwrap_or_else(|| config.web_search_mcp_url());
+    config::validate_web_search_mcp_url(&url)?;
+    Ok(Some(url))
 }
 
 async fn check_all(config: &config::Config) -> Result<()> {
@@ -318,5 +339,38 @@ mod tests {
     fn rejects_incomplete_model_check_target() {
         assert!(parse_check_target("alpha/", "/").is_err());
         assert!(parse_check_target("/model", "/").is_err());
+    }
+
+    #[test]
+    fn resolves_web_search_url_by_runtime_precedence() {
+        let configured = url::Url::parse("http://127.0.0.1:9092/configured").unwrap();
+        let override_url = url::Url::parse("http://127.0.0.1:9093/override").unwrap();
+        let config = config::Config {
+            web_search: Some(config::WebSearchConfig {
+                mcp_url: configured.clone(),
+            }),
+            ..config::Config::default()
+        };
+
+        assert_eq!(resolve_web_search_url(&config, false, None).unwrap(), None);
+        assert_eq!(
+            resolve_web_search_url(&config, true, None).unwrap(),
+            Some(configured)
+        );
+        assert_eq!(
+            resolve_web_search_url(&config, true, Some(override_url.clone())).unwrap(),
+            Some(override_url)
+        );
+    }
+
+    #[test]
+    fn resolves_default_web_search_url_without_configuration() {
+        assert_eq!(
+            resolve_web_search_url(&config::Config::default(), true, None)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:9091/mcp"
+        );
     }
 }

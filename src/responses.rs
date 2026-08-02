@@ -968,6 +968,13 @@ struct StreamOutput {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResponsesWebSearchHandle {
+    output_index: usize,
+    item_id: String,
+    query: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct StreamTool {
     output_index: Option<usize>,
@@ -990,6 +997,7 @@ pub struct ResponsesStreamConverter {
     text: Option<StreamOutput>,
     reasoning: Option<StreamOutput>,
     tool_calls: BTreeMap<usize, StreamTool>,
+    extra_output: Vec<(usize, Value)>,
     usage: Option<ChatUsage>,
     finish_reason: Option<String>,
 }
@@ -1015,9 +1023,112 @@ impl ResponsesStreamConverter {
             text: None,
             reasoning: None,
             tool_calls: BTreeMap::new(),
+            extra_output: Vec::new(),
             usage: None,
             finish_reason: None,
         }
+    }
+
+    pub fn start(&mut self) -> Vec<Value> {
+        if self.completed {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        self.ensure_started(&mut events);
+        events
+    }
+
+    pub fn start_web_search(
+        &mut self,
+        query: impl Into<String>,
+    ) -> (ResponsesWebSearchHandle, Vec<Value>) {
+        let mut events = self.start();
+        let query = query.into();
+        let output_index = self.take_output_index();
+        let item_id = generated_id("ws");
+        let item = web_search_call_item(&item_id, &query, "in_progress", None);
+        self.emit(
+            &mut events,
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": item
+            }),
+        );
+        self.emit(
+            &mut events,
+            "response.web_search_call.in_progress",
+            json!({
+                "item_id": item_id,
+                "output_index": output_index
+            }),
+        );
+        self.emit(
+            &mut events,
+            "response.web_search_call.searching",
+            json!({
+                "item_id": item_id,
+                "output_index": output_index
+            }),
+        );
+        (
+            ResponsesWebSearchHandle {
+                output_index,
+                item_id,
+                query,
+            },
+            events,
+        )
+    }
+
+    pub fn complete_web_search(
+        &mut self,
+        handle: ResponsesWebSearchHandle,
+        result: &Value,
+    ) -> Vec<Value> {
+        if self.completed {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        let item = web_search_call_item(&handle.item_id, &handle.query, "completed", Some(result));
+        self.emit(
+            &mut events,
+            "response.web_search_call.completed",
+            json!({
+                "item_id": handle.item_id,
+                "output_index": handle.output_index
+            }),
+        );
+        self.emit(
+            &mut events,
+            "response.output_item.done",
+            json!({
+                "output_index": handle.output_index,
+                "item": item
+            }),
+        );
+        self.extra_output.push((handle.output_index, item));
+        events
+    }
+
+    pub fn fail(&mut self, message: impl Into<String>) -> Vec<Value> {
+        if self.completed {
+            return Vec::new();
+        }
+        let mut events = self.start();
+        let error = json!({
+            "code": "router_error",
+            "message": message.into()
+        });
+        let mut response = self.response_snapshot("failed", Vec::new(), Value::Null);
+        response["error"] = error;
+        self.emit(
+            &mut events,
+            "response.failed",
+            json!({ "response": response }),
+        );
+        self.completed = true;
+        events
     }
 
     pub fn push(&mut self, item: ChatStreamItem) -> Result<Vec<Value>> {
@@ -1278,7 +1389,7 @@ impl ResponsesStreamConverter {
     }
 
     fn complete(&mut self, events: &mut Vec<Value>) -> Result<()> {
-        let mut final_output = Vec::new();
+        let mut final_output = std::mem::take(&mut self.extra_output);
         let tool_indices = self.tool_calls.keys().copied().collect::<Vec<_>>();
         for index in tool_indices {
             self.start_tool(index, events, true);
@@ -1526,6 +1637,34 @@ impl ResponsesStreamConverter {
         );
         events.push(Value::Object(object));
     }
+}
+
+fn web_search_call_item(item_id: &str, query: &str, status: &str, result: Option<&Value>) -> Value {
+    let mut action = json!({
+        "type": "search",
+        "query": query,
+        "queries": [query]
+    });
+    if let Some(sources) = result
+        .and_then(|result| result.get("sources"))
+        .and_then(Value::as_array)
+    {
+        action["sources"] = Value::Array(
+            sources
+                .iter()
+                .filter_map(|source| {
+                    let url = source.get("url")?.as_str()?;
+                    Some(json!({ "type": "url", "url": url }))
+                })
+                .collect(),
+        );
+    }
+    json!({
+        "id": item_id,
+        "type": "web_search_call",
+        "status": status,
+        "action": action
+    })
 }
 
 pub fn responses_sse_event(event: &Value) -> Result<String> {
@@ -2298,6 +2437,85 @@ mod tests {
         assert_eq!(
             response["output"][0]["arguments"],
             json!({ "query": "calendar", "limit": 2 })
+        );
+    }
+
+    #[test]
+    fn streaming_conversion_includes_web_search_status_and_final_output() {
+        let mut converter = ResponsesStreamConverter::with_response_id(
+            "glm-test",
+            ToolRegistry::default(),
+            "resp_search",
+        );
+        let mut events = converter.start();
+        let (handle, started) = converter.start_web_search("latest Rust release");
+        events.extend(started);
+        events.extend(converter.complete_web_search(
+            handle,
+            &json!({
+                "answer": "Rust result",
+                "sources": [{
+                    "title": "Rust",
+                    "url": "https://www.rust-lang.org/"
+                }]
+            }),
+        ));
+        events.extend(
+            converter
+                .push(ChatStreamItem::Chunk(chunk(ChatDelta {
+                    content: Some(json!("Search complete.")),
+                    ..ChatDelta::default()
+                })))
+                .unwrap(),
+        );
+        events.extend(converter.push(ChatStreamItem::Done).unwrap());
+
+        let types = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(types[0], "response.created");
+        assert_eq!(types[1], "response.in_progress");
+        assert!(types.contains(&"response.web_search_call.in_progress"));
+        assert!(types.contains(&"response.web_search_call.searching"));
+        assert!(types.contains(&"response.web_search_call.completed"));
+        assert!(events.windows(2).all(|pair| {
+            pair[0]["sequence_number"].as_u64().unwrap() + 1
+                == pair[1]["sequence_number"].as_u64().unwrap()
+        }));
+
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "web_search_call");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[0]["action"]["query"], "latest Rust release");
+        assert_eq!(
+            output[0]["action"]["sources"][0]["url"],
+            "https://www.rust-lang.org/"
+        );
+        assert_eq!(output[1]["type"], "message");
+    }
+
+    #[test]
+    fn streaming_conversion_emits_failed_response() {
+        let mut converter = ResponsesStreamConverter::with_response_id(
+            "glm-test",
+            ToolRegistry::default(),
+            "resp_failed",
+        );
+        let events = converter.fail("MCP request failed");
+
+        assert_eq!(events[0]["type"], "response.created");
+        assert_eq!(events[1]["type"], "response.in_progress");
+        assert_eq!(events[2]["type"], "response.failed");
+        assert_eq!(events[2]["response"]["status"], "failed");
+        assert_eq!(
+            events[2]["response"]["error"]["message"],
+            "MCP request failed"
         );
     }
 

@@ -17,7 +17,7 @@ openai_compact_listen = "127.0.0.1:8788"
 separator = "/"
 context_window = 128000
 
-# Web Search is disabled unless this section is present.
+# Optional Web Search MCP URL override. Enable it at runtime with `serve --web-search`.
 # [web_search]
 # mcp_url = "http://127.0.0.1:9091/mcp"
 
@@ -151,6 +151,13 @@ impl Config {
         Ok(provider)
     }
 
+    pub fn web_search_mcp_url(&self) -> Url {
+        self.web_search
+            .as_ref()
+            .map(|web_search| web_search.mcp_url.clone())
+            .unwrap_or_else(default_web_search_mcp_url)
+    }
+
     fn validate_inner(&self, resolve_keys: bool) -> Result<()> {
         if self.providers.is_empty() {
             bail!("at least one provider must be configured");
@@ -171,15 +178,7 @@ impl Config {
             bail!("server.listen and server.openai_compact_listen must be different");
         }
         if let Some(web_search) = &self.web_search {
-            if !matches!(web_search.mcp_url.scheme(), "http" | "https") {
-                bail!("web_search.mcp_url must use http or https");
-            }
-            if web_search.mcp_url.host_str().is_none() {
-                bail!("web_search.mcp_url must contain a host");
-            }
-            if web_search.mcp_url.fragment().is_some() {
-                bail!("web_search.mcp_url must not contain a fragment");
-            }
+            validate_web_search_mcp_url(&web_search.mcp_url)?;
         }
 
         let mut folded_names = HashSet::new();
@@ -199,6 +198,23 @@ impl Config {
         }
         Ok(())
     }
+}
+
+pub fn default_web_search_mcp_url() -> Url {
+    Url::parse("http://127.0.0.1:9091/mcp").expect("valid default Web Search MCP URL")
+}
+
+pub fn validate_web_search_mcp_url(url: &Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("web_search.mcp_url must use http or https");
+    }
+    if url.host_str().is_none() {
+        bail!("web_search.mcp_url must contain a host");
+    }
+    if url.fragment().is_some() {
+        bail!("web_search.mcp_url must not contain a fragment");
+    }
+    Ok(())
 }
 
 fn validate_provider_url(name: &str, provider: &ProviderConfig) -> Result<()> {
@@ -477,6 +493,10 @@ models = ["sol"]
             .is_empty());
         assert!(config.providers["example"].chat_models.is_empty());
         assert!(config.web_search.is_none());
+        assert_eq!(
+            config.web_search_mcp_url().as_str(),
+            "http://127.0.0.1:9091/mcp"
+        );
     }
 
     #[test]
@@ -501,6 +521,21 @@ models = ["sol"]
 
         config.web_search.as_mut().unwrap().mcp_url = Url::parse("ftp://127.0.0.1/mcp").unwrap();
         assert!(config.validate_for_save().is_err());
+    }
+
+    #[test]
+    fn configured_web_search_url_overrides_the_default() {
+        let config = Config {
+            web_search: Some(WebSearchConfig {
+                mcp_url: Url::parse("http://127.0.0.1:9092/custom").unwrap(),
+            }),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.web_search_mcp_url().as_str(),
+            "http://127.0.0.1:9092/custom"
+        );
     }
 
     #[test]
