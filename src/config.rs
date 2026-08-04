@@ -38,6 +38,8 @@ pub struct Config {
     #[serde(default)]
     pub catalog: CatalogConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchConfig>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
@@ -83,6 +85,12 @@ impl Default for CatalogConfig {
 #[serde(deny_unknown_fields)]
 pub struct WebSearchConfig {
     pub mcp_url: Url,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+    pub unprefixed_model_provider: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -179,6 +187,23 @@ impl Config {
         }
         if let Some(web_search) = &self.web_search {
             validate_web_search_mcp_url(&web_search.mcp_url)?;
+        }
+        if let Some(routing) = &self.routing {
+            let provider = self
+                .providers
+                .get(&routing.unprefixed_model_provider)
+                .with_context(|| {
+                    format!(
+                        "routing.unprefixed_model_provider `{}` is not configured",
+                        routing.unprefixed_model_provider
+                    )
+                })?;
+            if !provider.enabled {
+                bail!(
+                    "routing.unprefixed_model_provider `{}` is disabled",
+                    routing.unprefixed_model_provider
+                );
+            }
         }
 
         let mut folded_names = HashSet::new();
@@ -471,6 +496,13 @@ mod tests {
     }
 
     #[test]
+    fn default_serialization_omits_routing_section() {
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("[routing]"));
+        assert!(!text.contains("unprefixed_model_provider"));
+    }
+
+    #[test]
     fn existing_config_defaults_new_compact_fields() {
         let config: Config = toml::from_str(
             r#"
@@ -492,6 +524,7 @@ models = ["sol"]
             .remote_compaction_models
             .is_empty());
         assert!(config.providers["example"].chat_models.is_empty());
+        assert!(config.routing.is_none());
         assert!(config.web_search.is_none());
         assert_eq!(
             config.web_search_mcp_url().as_str(),
@@ -536,6 +569,33 @@ models = ["sol"]
             config.web_search_mcp_url().as_str(),
             "http://127.0.0.1:9092/custom"
         );
+    }
+
+    #[test]
+    fn unprefixed_model_provider_must_exist_and_be_enabled() {
+        let provider = ProviderConfig {
+            base_url: Url::parse("https://example.com/v1").unwrap(),
+            api_key: Some("secret".into()),
+            api_key_env: None,
+            enabled: true,
+            models: vec!["sol".into()],
+            chat_models: Vec::new(),
+            remote_compaction_models: Vec::new(),
+        };
+        let mut config = Config {
+            routing: Some(RoutingConfig {
+                unprefixed_model_provider: "example".into(),
+            }),
+            providers: BTreeMap::from([("example".to_owned(), provider)]),
+            ..Config::default()
+        };
+        assert!(config.validate_for_save().is_ok());
+
+        config.providers.get_mut("example").unwrap().enabled = false;
+        assert!(config.validate_for_save().is_err());
+
+        config.routing.as_mut().unwrap().unprefixed_model_provider = "missing".into();
+        assert!(config.validate_for_save().is_err());
     }
 
     #[test]

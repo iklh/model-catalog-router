@@ -81,6 +81,11 @@ context_window = 128000
 [web_search]
 mcp_url = "http://127.0.0.1:9091/mcp"
 
+# Optional compatibility routing for unprefixed models sent by resumed Codex turns.
+# Configure this interactively with `model-catalog-router config`.
+# [routing]
+# unprefixed_model_provider = "newapi-a"
+
 [providers.newapi-a]
 base_url = "https://newapi-a.example.com/v1"
 api_key_env = "NEWAPI_A_API_KEY"
@@ -203,7 +208,7 @@ Each generated profile contains its own local Provider settings and catalog path
 
 Generated Router entries match each upstream model ID against `$CODEX_HOME/models_cache.json` (or `~/.codex/models_cache.json`) and inherit that Codex model's supported reasoning levels. The Router uses `medium` as the catalog default when the model supports it; otherwise it keeps a valid default from the matching Codex model. Models that Codex does not recognize remain available without invented reasoning options.
 
-Unprefixed model requests are rejected. There is no default Router Provider; `newapi-a/gpt-5` and `newapi-b/gpt-5` always have unambiguous destinations.
+Unprefixed model requests are rejected by default. The interactive `config` command can select one enabled Provider as `routing.unprefixed_model_provider`; the base Router then adds only that Provider prefix before applying its normal model validation and forwarding. This compatibility setting does not apply to the OpenAI compact listener. It is not a default Router Provider: already-prefixed models such as `newapi-b/gpt-5` keep their explicit destination.
 
 ## Run as a User systemd Service on Debian 13
 

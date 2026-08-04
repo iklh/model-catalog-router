@@ -279,6 +279,7 @@ mod tests {
         let config = Config {
             server: ServerConfig::default(),
             catalog: CatalogConfig::default(),
+            routing: None,
             web_search: None,
             providers,
         };

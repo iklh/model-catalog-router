@@ -4,7 +4,7 @@ use crate::catalog::{
 };
 use crate::config::{
     default_web_search_mcp_url, validate_provider_name, validate_web_search_mcp_url, Config,
-    ProviderConfig, WebSearchConfig,
+    ProviderConfig, RoutingConfig, WebSearchConfig,
 };
 use crate::sync;
 use anyhow::{bail, Context, Result};
@@ -17,7 +17,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let mut config = Config::load_or_default(config_path)?;
     loop {
         print_menu(&config);
-        let choice = prompt("e/n/d/r/t/l/w/q> ", None)?.to_ascii_lowercase();
+        let choice = prompt("e/n/d/r/t/l/u/w/q> ", None)?.to_ascii_lowercase();
         if choice == "q" {
             return Ok(());
         }
@@ -27,6 +27,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
             "d" => delete_provider(&config),
             "r" => refresh_provider(&config).await,
             "t" => toggle_provider(&config),
+            "u" => configure_unprefixed_model_provider(&config),
             "w" => configure_web_search(&config),
             "l" => {
                 show_provider_models(&config)?;
@@ -34,7 +35,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
             }
             "" => continue,
             _ => {
-                println!("Unknown choice. Enter e, n, d, r, t, l, w, or q.");
+                println!("Unknown choice. Enter e, n, d, r, t, l, u, w, or q.");
                 continue;
             }
         };
@@ -123,14 +124,70 @@ fn print_menu(config: &Config) {
             .map(|web_search| web_search.mcp_url.as_str())
             .unwrap_or("http://127.0.0.1:9091/mcp (default)")
     );
+    println!(
+        "Unprefixed model provider: {}",
+        config
+            .routing
+            .as_ref()
+            .map(|routing| routing.unprefixed_model_provider.as_str())
+            .unwrap_or("disabled")
+    );
     println!("\ne) Edit existing provider");
     println!("n) New provider");
     println!("d) Delete provider");
     println!("r) Refresh provider models");
     println!("t) Toggle provider enabled");
     println!("l) List provider models");
+    println!("u) Configure unprefixed model provider");
     println!("w) Configure Web Search MCP URL");
     println!("q) Quit configuration\n");
+}
+
+fn configure_unprefixed_model_provider(config: &Config) -> Result<Option<Config>> {
+    let names = config
+        .providers
+        .iter()
+        .filter(|(_, provider)| provider.enabled)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        println!("No enabled providers are configured.");
+        return Ok(None);
+    }
+
+    println!("\nUnprefixed model provider:");
+    println!("0) Disabled");
+    for (index, name) in names.iter().enumerate() {
+        let current = config
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.unprefixed_model_provider == *name);
+        println!(
+            "{}) {}{}",
+            index + 1,
+            name,
+            if current { " (current)" } else { "" }
+        );
+    }
+    let input = prompt("Number (Enter to cancel)", None)?;
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let index = input
+        .parse::<usize>()
+        .context("provider choice must be a number")?;
+    let mut updated = config.clone();
+    if index == 0 {
+        updated.routing = None;
+    } else {
+        let name = names
+            .get(index - 1)
+            .context("provider choice is out of range")?;
+        updated.routing = Some(RoutingConfig {
+            unprefixed_model_provider: name.clone(),
+        });
+    }
+    Ok(Some(updated))
 }
 
 fn configure_web_search(config: &Config) -> Result<Option<Config>> {
@@ -698,6 +755,14 @@ fn delete_provider(config: &Config) -> Result<Option<Config>> {
     }
     let mut updated = config.clone();
     updated.providers.remove(&name);
+    if updated
+        .routing
+        .as_ref()
+        .is_some_and(|routing| routing.unprefixed_model_provider == name)
+    {
+        updated.routing = None;
+        println!("Unprefixed model provider was cleared.");
+    }
     Ok(Some(updated))
 }
 
@@ -708,6 +773,15 @@ fn toggle_provider(config: &Config) -> Result<Option<Config>> {
     let mut updated = config.clone();
     let provider = updated.providers.get_mut(&name).expect("selected provider");
     provider.enabled = !provider.enabled;
+    if !provider.enabled
+        && updated
+            .routing
+            .as_ref()
+            .is_some_and(|routing| routing.unprefixed_model_provider == name)
+    {
+        updated.routing = None;
+        println!("Unprefixed model provider was cleared.");
+    }
     println!(
         "Provider `{name}` will be {}.",
         if provider.enabled {

@@ -222,10 +222,31 @@ async fn forward(
         .and_then(Value::as_str)
         .ok_or_else(|| ProxyError::bad_request("request body must contain a string `model`"))?
         .to_owned();
-    let (provider_name, upstream_model) =
-        split_model(&routed_model, &state.config.catalog.separator)?;
-    let provider_name = provider_name.to_owned();
-    let upstream_model = upstream_model.to_owned();
+    let unprefixed_provider = if state.mode == ServiceMode::Base {
+        state
+            .config
+            .routing
+            .as_ref()
+            .map(|routing| routing.unprefixed_model_provider.as_str())
+    } else {
+        None
+    };
+    let (provider_name, upstream_model, completed_unprefixed) = resolve_model_route(
+        &routed_model,
+        &state.config.catalog.separator,
+        unprefixed_provider,
+    )?;
+    if completed_unprefixed {
+        info!(
+            original_model = routed_model,
+            effective_model = format!(
+                "{provider_name}{}{upstream_model}",
+                state.config.catalog.separator
+            ),
+            provider = provider_name,
+            "completed unprefixed model route"
+        );
+    }
     let provider = state
         .config
         .providers
@@ -825,6 +846,22 @@ fn split_model<'a>(model: &'a str, separator: &str) -> Result<(&'a str, &'a str)
     Ok((provider, upstream))
 }
 
+fn resolve_model_route(
+    model: &str,
+    separator: &str,
+    unprefixed_provider: Option<&str>,
+) -> Result<(String, String, bool), ProxyError> {
+    if model.contains(separator) {
+        let (provider, upstream) = split_model(model, separator)?;
+        return Ok((provider.to_owned(), upstream.to_owned(), false));
+    }
+    if let Some(provider) = unprefixed_provider {
+        return Ok((provider.to_owned(), model.to_owned(), true));
+    }
+    split_model(model, separator)?;
+    unreachable!("split_model rejects models without the separator")
+}
+
 fn should_forward_request_header(name: &HeaderName) -> bool {
     name != AUTHORIZATION
         && name != HOST
@@ -884,7 +921,7 @@ impl IntoResponse for ProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CatalogConfig, ProviderConfig, ServerConfig};
+    use crate::config::{CatalogConfig, ProviderConfig, RoutingConfig, ServerConfig};
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::post;
@@ -939,6 +976,19 @@ mod tests {
         assert!(split_model("model-only", "/").is_err());
     }
 
+    #[test]
+    fn completes_unprefixed_model_with_configured_provider() {
+        assert_eq!(
+            resolve_model_route("model-only", "/", Some("alpha")).unwrap(),
+            ("alpha".to_owned(), "model-only".to_owned(), true)
+        );
+        assert_eq!(
+            resolve_model_route("beta/model", "/", Some("alpha")).unwrap(),
+            ("beta".to_owned(), "model".to_owned(), false)
+        );
+        assert!(resolve_model_route("model-only", "/", None).is_err());
+    }
+
     #[tokio::test]
     async fn rewrites_model_and_upstream_authorization() {
         #[derive(Clone, Default)]
@@ -976,7 +1026,7 @@ mod tests {
                 api_key: Some("upstream-secret".to_owned()),
                 api_key_env: None,
                 enabled: true,
-                models: vec!["org/model".to_owned()],
+                models: vec!["org/model".to_owned(), "plain-model".to_owned()],
                 chat_models: Vec::new(),
                 remote_compaction_models: vec!["org/model".to_owned()],
             },
@@ -990,6 +1040,9 @@ mod tests {
                 separator: "/".to_owned(),
                 context_window: 128_000,
             },
+            routing: Some(RoutingConfig {
+                unprefixed_model_provider: "alpha".to_owned(),
+            }),
             web_search: None,
             providers,
         };
@@ -1015,6 +1068,22 @@ mod tests {
         assert_eq!(
             capture.0.lock().unwrap().clone(),
             Some(("Bearer upstream-secret".to_owned(), "org/model".to_owned()))
+        );
+
+        let completed = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({ "model": "plain-model", "stream": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert_eq!(completed.text().await.unwrap(), "data: routed\n\n");
+        assert_eq!(
+            capture.0.lock().unwrap().clone(),
+            Some((
+                "Bearer upstream-secret".to_owned(),
+                "plain-model".to_owned()
+            ))
         );
 
         let rejected = reqwest::Client::new()
@@ -1828,6 +1897,9 @@ mod tests {
         let config = Config {
             server: ServerConfig::default(),
             catalog: CatalogConfig::default(),
+            routing: Some(RoutingConfig {
+                unprefixed_model_provider: "alpha".to_owned(),
+            }),
             web_search: None,
             providers: BTreeMap::from([("alpha".to_owned(), provider)]),
         };
@@ -1866,6 +1938,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+
+        let unprefixed = client
+            .post(format!("http://{router_addr}/v1/responses"))
+            .json(&json!({ "model": "sol" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unprefixed.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             capture.0.lock().unwrap().as_slice(),
             ["sol", "sol-openai-compact"]
