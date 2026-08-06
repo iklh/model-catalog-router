@@ -1,3 +1,4 @@
+use crate::anthropic;
 use crate::chat::{
     ChatAssistantMessage, ChatChunkChoice, ChatClient, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatDelta, ChatFunctionCallDelta, ChatMessage, ChatResponse, ChatRole,
@@ -300,6 +301,31 @@ async fn forward(
         )
         .await;
     }
+    if state.mode == ServiceMode::Base
+        && method == Method::POST
+        && path == "responses"
+        && provider
+            .messages_models
+            .iter()
+            .any(|model| model == &upstream_model)
+    {
+        info!(
+            provider = provider_name,
+            model = forwarded_model,
+            path,
+            mode = state.mode.name(),
+            transport = "anthropic-messages",
+            "converting Responses request"
+        );
+        return forward_responses_via_messages(
+            &state.client,
+            &provider_name,
+            provider,
+            &payload,
+            state.web_search.is_some(),
+        )
+        .await;
+    }
 
     let mut endpoint = provider.endpoint(path).map_err(ProxyError::internal)?;
     endpoint.set_query(uri.query());
@@ -326,6 +352,67 @@ async fn forward(
     );
     let upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
     response_from_upstream(upstream)
+}
+
+async fn forward_responses_via_messages(
+    client: &reqwest::Client,
+    provider_name: &str,
+    provider: &ProviderConfig,
+    payload: &Value,
+    web_search_enabled: bool,
+) -> Result<Response, ProxyError> {
+    let converted = responses_request_to_chat_with_web_search(payload, web_search_enabled)
+        .map_err(ProxyError::bad_request)?;
+    let requested_model = converted.request.model.clone();
+    let tools = converted.tools;
+    let result = anthropic::send(client, provider_name, provider, payload, web_search_enabled)
+        .await
+        .map_err(ProxyError::bad_gateway)?;
+    if let Some(completion) = result.response {
+        let response = chat_completion_to_responses(&completion, &requested_model, &tools)
+            .map_err(ProxyError::bad_gateway)?;
+        return Ok(Json(response).into_response());
+    }
+    let stream = result.stream.expect("Anthropic response has a stream");
+    let converter = ResponsesStreamConverter::new(requested_model, tools);
+    let body_stream = stream::try_unfold(
+        (stream, converter, VecDeque::<Bytes>::new(), false),
+        |(mut stream, mut converter, mut pending, mut finished)| async move {
+            loop {
+                if let Some(bytes) = pending.pop_front() {
+                    return Ok::<_, std::io::Error>(Some((
+                        bytes,
+                        (stream, converter, pending, finished),
+                    )));
+                }
+                if finished {
+                    return Ok(None);
+                }
+                let next = stream.next_chunk().await.map_err(std::io::Error::other)?;
+                let Some(chunk) = next else {
+                    finished = true;
+                    for event in converter.finish().map_err(std::io::Error::other)? {
+                        pending.push_back(Bytes::from(
+                            responses_sse_event(&event).map_err(std::io::Error::other)?,
+                        ));
+                    }
+                    continue;
+                };
+                for event in converter
+                    .push(ChatStreamItem::Chunk(chunk))
+                    .map_err(std::io::Error::other)?
+                {
+                    pending.push_back(Bytes::from(
+                        responses_sse_event(&event).map_err(std::io::Error::other)?,
+                    ));
+                }
+            }
+        },
+    );
+    Ok(Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(body_stream))
+        .expect("valid Responses stream response"))
 }
 
 async fn forward_responses_via_chat(
@@ -1028,6 +1115,7 @@ mod tests {
                 enabled: true,
                 models: vec!["org/model".to_owned(), "plain-model".to_owned()],
                 chat_models: Vec::new(),
+                messages_models: Vec::new(),
                 remote_compaction_models: vec!["org/model".to_owned()],
             },
         );
@@ -1150,6 +1238,7 @@ mod tests {
                     enabled: true,
                     models: vec!["glm-test".to_owned()],
                     chat_models: vec!["glm-test".to_owned()],
+                    messages_models: Vec::new(),
                     remote_compaction_models: Vec::new(),
                 },
             )]),
@@ -1244,6 +1333,7 @@ mod tests {
                     enabled: true,
                     models: vec!["glm-test".to_owned()],
                     chat_models: vec!["glm-test".to_owned()],
+                    messages_models: Vec::new(),
                     remote_compaction_models: Vec::new(),
                 },
             )]),
@@ -1341,6 +1431,7 @@ mod tests {
                     enabled: true,
                     models: vec!["glm-test".to_owned()],
                     chat_models: vec!["glm-test".to_owned()],
+                    messages_models: Vec::new(),
                     remote_compaction_models: Vec::new(),
                 },
             )]),
@@ -1438,6 +1529,7 @@ mod tests {
                     enabled: true,
                     models: vec!["glm-test".to_owned()],
                     chat_models: vec!["glm-test".to_owned()],
+                    messages_models: Vec::new(),
                     remote_compaction_models: Vec::new(),
                 },
             )]),
@@ -1892,6 +1984,7 @@ mod tests {
             enabled: true,
             models: vec!["sol".to_owned(), "terra".to_owned()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: vec!["sol".to_owned()],
         };
         let config = Config {
@@ -1975,6 +2068,7 @@ mod tests {
                     enabled: true,
                     models: vec!["glm-test".to_owned()],
                     chat_models: vec!["glm-test".to_owned()],
+                    messages_models: Vec::new(),
                     remote_compaction_models: Vec::new(),
                 },
             )]),

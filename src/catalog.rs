@@ -432,6 +432,7 @@ mod tests {
             enabled: true,
             models: vec!["sol".into(), "terra".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: vec!["sol".into()],
         };
         let config = Config {
@@ -454,6 +455,7 @@ mod tests {
             enabled: true,
             models: vec!["glm-test".into(), "gpt-test".into()],
             chat_models: vec!["glm-test".into()],
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let config = Config {

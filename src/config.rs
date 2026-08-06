@@ -27,6 +27,7 @@ api_key_env = "EXAMPLE_NEW_API_KEY"
 enabled = true
 models = ["gpt-5"]
 chat_models = []
+messages_models = []
 remote_compaction_models = []
 "#;
 
@@ -107,6 +108,8 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub chat_models: Vec<String>,
+    #[serde(default)]
+    pub messages_models: Vec<String>,
     #[serde(default)]
     pub remote_compaction_models: Vec<String>,
 }
@@ -289,6 +292,20 @@ fn validate_provider(name: &str, provider: &ProviderConfig, resolve_key: bool) -
         .find(|model| !provider.models.contains(model))
     {
         bail!("provider `{name}` Chat model `{model}` is not present in models");
+    }
+    if provider
+        .messages_models
+        .iter()
+        .any(|model| model.trim().is_empty())
+    {
+        bail!("provider `{name}` contains an empty Messages model name");
+    }
+    if let Some(model) = provider
+        .messages_models
+        .iter()
+        .find(|model| !provider.models.contains(model))
+    {
+        bail!("provider `{name}` Messages model `{model}` is not present in models");
     }
     if provider
         .models
@@ -477,6 +494,7 @@ mod tests {
             enabled: true,
             models: vec!["gpt-test".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         assert_eq!(
@@ -541,6 +559,7 @@ models = ["sol"]
             enabled: true,
             models: vec!["glm-test".into()],
             chat_models: vec!["glm-test".into()],
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let mut config = Config {
@@ -580,6 +599,7 @@ models = ["sol"]
             enabled: true,
             models: vec!["sol".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let mut config = Config {
@@ -614,6 +634,7 @@ models = ["sol"]
             enabled: false,
             models: vec!["gpt-test".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let config = Config {
@@ -633,6 +654,7 @@ models = ["sol"]
             enabled: true,
             models: vec!["sol".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: vec!["terra".into()],
         };
         let config = Config {
@@ -651,6 +673,7 @@ models = ["sol"]
             enabled: true,
             models: vec!["sol".into()],
             chat_models: vec!["terra".into()],
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let config = Config {
@@ -669,6 +692,7 @@ models = ["sol"]
             enabled: true,
             models: vec!["sol".into()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let mut config = Config {

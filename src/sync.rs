@@ -273,6 +273,7 @@ mod tests {
                 enabled: true,
                 models: vec!["gpt-test".to_owned()],
                 chat_models: Vec::new(),
+                messages_models: Vec::new(),
                 remote_compaction_models: vec!["gpt-test".to_owned()],
             },
         );

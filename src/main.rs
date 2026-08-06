@@ -1,3 +1,4 @@
+mod anthropic;
 mod catalog;
 pub mod chat;
 mod cli;

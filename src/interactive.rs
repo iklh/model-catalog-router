@@ -371,6 +371,9 @@ async fn provider_wizard(
         chat_models: current
             .map(|provider| provider.chat_models.clone())
             .unwrap_or_default(),
+        messages_models: current
+            .map(|provider| provider.messages_models.clone())
+            .unwrap_or_default(),
         remote_compaction_models: current
             .map(|provider| provider.remote_compaction_models.clone())
             .unwrap_or_default(),
@@ -390,6 +393,12 @@ async fn provider_wizard(
                             current_models,
                             current.map(|provider| provider.chat_models.as_slice()),
                         )?;
+                        provider.messages_models = select_messages_models(
+                            &provider.models,
+                            &provider.chat_models,
+                            current.map(|provider| provider.models.as_slice()),
+                            current.map(|provider| provider.messages_models.as_slice()),
+                        )?;
                         provider.remote_compaction_models = configure_remote_compaction(
                             &discovered,
                             &provider.models,
@@ -407,6 +416,12 @@ async fn provider_wizard(
                             current.map(|provider| provider.models.as_slice()),
                             current.map(|provider| provider.chat_models.as_slice()),
                         )?;
+                        provider.messages_models = select_messages_models(
+                            &provider.models,
+                            &provider.chat_models,
+                            current.map(|provider| provider.models.as_slice()),
+                            current.map(|provider| provider.messages_models.as_slice()),
+                        )?;
                         provider.remote_compaction_models.clear();
                         break;
                     }
@@ -420,6 +435,12 @@ async fn provider_wizard(
                 current.map(|provider| provider.models.as_slice()),
                 current.map(|provider| provider.chat_models.as_slice()),
             )?;
+            provider.messages_models = select_messages_models(
+                &provider.models,
+                &provider.chat_models,
+                current.map(|provider| provider.models.as_slice()),
+                current.map(|provider| provider.messages_models.as_slice()),
+            )?;
             provider.remote_compaction_models.clear();
         }
     } else if prompt_yes_no("Change Chat compatibility selection", false)? {
@@ -427,6 +448,12 @@ async fn provider_wizard(
             &provider.models,
             Some(&provider.models),
             Some(&provider.chat_models),
+        )?;
+        provider.messages_models = select_messages_models(
+            &provider.models,
+            &provider.chat_models,
+            Some(&provider.models),
+            Some(&provider.messages_models),
         )?;
     }
     if provider.models.is_empty() {
@@ -544,6 +571,12 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
         Some(&provider.models),
         Some(&provider.chat_models),
     )?;
+    let messages_models = select_messages_models(
+        &selected,
+        &chat_models,
+        Some(&provider.models),
+        Some(&provider.messages_models),
+    )?;
     let remote_compaction_models = configure_remote_compaction(
         &discovered,
         &selected,
@@ -552,9 +585,67 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
     let mut updated = config.clone();
     provider.models = selected;
     provider.chat_models = chat_models;
+    provider.messages_models = messages_models;
     provider.remote_compaction_models = remote_compaction_models;
     updated.providers.insert(name, provider);
     Ok(Some(updated))
+}
+
+fn select_messages_models(
+    selected_models: &[String],
+    chat_models: &[String],
+    previous_models: Option<&[String]>,
+    previous_messages_models: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let candidates = selected_models
+        .iter()
+        .filter(|model| !chat_models.contains(model))
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let previous_models = previous_models.unwrap_or_default();
+    let previous = previous_messages_models.unwrap_or_default();
+    let defaults = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, model)| {
+            let selected = if previous_models.contains(model) {
+                previous.contains(model)
+            } else {
+                false
+            };
+            selected.then_some(i + 1)
+        })
+        .collect::<Vec<_>>();
+    println!("\nAnthropic Messages compatibility models:\n");
+    for (index, model) in candidates.iter().enumerate() {
+        println!(
+            "{:>3}) [{}] {}",
+            index + 1,
+            if defaults.contains(&(index + 1)) {
+                "x"
+            } else {
+                " "
+            },
+            model
+        );
+    }
+    println!("\nModels marked [x] will use Anthropic Messages compatibility.");
+    println!(
+        "Press Enter to keep the marked models, or enter a selection such as 1,3, all, or none."
+    );
+    let input = prompt("Select Messages models", Some("keep marked"))?;
+    let indices = if input.eq_ignore_ascii_case("none") {
+        Vec::new()
+    } else {
+        resolve_model_selection(&input, defaults, candidates.len())?
+    };
+    Ok(indices
+        .into_iter()
+        .map(|index| candidates[index - 1].clone())
+        .collect())
 }
 
 fn configure_remote_compaction(

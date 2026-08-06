@@ -11,6 +11,8 @@ base_url = "https://newapi-a.example.com/v1"
 api_key_env = "NEWAPI_A_API_KEY"
 enabled = true
 models = ["gpt-5", "gpt-5-mini"]
+chat_models = []
+messages_models = []
 remote_compaction_models = ["gpt-5"]
 
 [providers.newapi-b]
@@ -18,4 +20,6 @@ base_url = "https://newapi-b.example.com/v1"
 api_key = "sk-replace-me"
 enabled = true
 models = ["claude-sonnet"]
+chat_models = []
+messages_models = ["claude-sonnet"]
 remote_compaction_models = []

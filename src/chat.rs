@@ -887,6 +887,7 @@ data: [DONE]
             enabled: true,
             models: vec!["model-a".to_owned()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let request = ChatCompletionRequest::new(
@@ -945,6 +946,7 @@ data: [DONE]
             enabled: true,
             models: vec!["model-a".to_owned()],
             chat_models: Vec::new(),
+            messages_models: Vec::new(),
             remote_compaction_models: Vec::new(),
         };
         let request = ChatCompletionRequest::new(
