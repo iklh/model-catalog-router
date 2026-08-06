@@ -33,6 +33,12 @@ pub async fn send(
 ) -> Result<AnthropicResponse> {
     let converted = responses_request_to_chat_with_web_search(payload, web_search_enabled)?;
     let requested_model = converted.request.model.clone();
+    if converted.request.max_completion_tokens.is_none() {
+        tracing::warn!(
+            model = %requested_model,
+            "Responses request omitted max_output_tokens; forwarding Anthropic Messages request without max_tokens"
+        );
+    }
     let body = request_body(&converted.request, &converted.tools)?;
     let endpoint = provider.endpoint("messages")?;
     let key = provider.resolved_api_key(provider_name)?;
@@ -83,6 +89,20 @@ pub async fn send(
             .json::<Value>()
             .await
             .context("invalid Anthropic response")?;
+        let stop_reason = body.get("stop_reason").and_then(|value| value.as_str());
+        tracing::info!(
+            model = %requested_model,
+            stop_reason = ?stop_reason,
+            usage = ?body.get("usage"),
+            "Anthropic Messages response completed"
+        );
+        if stop_reason == Some("max_tokens") {
+            tracing::warn!(
+                model = %requested_model,
+                usage = ?body.get("usage"),
+                "Anthropic Messages response stopped because max_tokens was reached"
+            );
+        }
         Ok(AnthropicResponse {
             response: Some(response_to_chat(body)?),
             stream: None,
@@ -139,9 +159,11 @@ fn request_body(
     let mut body = json!({
         "model": request.model,
         "messages": messages,
-        "max_tokens": request.max_completion_tokens.unwrap_or(4096),
         "stream": request.stream
     });
+    if let Some(max_tokens) = request.max_completion_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
     if !system.is_empty() {
         body["system"] = Value::String(system.join("\n\n"));
     }
@@ -309,6 +331,23 @@ impl AnthropicStream {
                     ChatDelta::default()
                 };
                 if event_type == "message_delta" {
+                    let stop_reason = value
+                        .get("delta")
+                        .and_then(|v| v.get("stop_reason"))
+                        .and_then(Value::as_str);
+                    tracing::info!(
+                        model = self.model.as_deref().unwrap_or_default(),
+                        stop_reason = ?stop_reason,
+                        usage = ?value.get("usage"),
+                        "Anthropic Messages stream completed"
+                    );
+                    if stop_reason == Some("max_tokens") {
+                        tracing::warn!(
+                            model = self.model.as_deref().unwrap_or_default(),
+                            usage = ?value.get("usage"),
+                            "Anthropic Messages response stopped because max_tokens was reached"
+                        );
+                    }
                     let reason = value
                         .get("delta")
                         .and_then(|v| v.get("stop_reason"))
