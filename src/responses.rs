@@ -707,15 +707,32 @@ fn reasoning_item_text(object: &Map<String, Value>) -> Result<String> {
         let Some(parts) = object.get(key) else {
             continue;
         };
-        for part in parts
-            .as_array()
-            .with_context(|| format!("reasoning item `{key}` must be an array"))?
-        {
-            let part = part
-                .as_object()
-                .context("reasoning content part must be an object")?;
-            if let Some(value) = part.get("text") {
-                text.push_str(&value_as_string(value, "reasoning text")?);
+        match parts {
+            Value::Null => {}
+            Value::String(value) => text.push_str(value),
+            Value::Array(parts) => {
+                for part in parts {
+                    match part {
+                        Value::String(value) => text.push_str(value),
+                        Value::Object(part) => {
+                            if let Some(value) = part.get("text") {
+                                text.push_str(&value_as_string(value, "reasoning text")?);
+                            }
+                        }
+                        _ => bail!("reasoning `{key}` part must be an object or string"),
+                    }
+                }
+            }
+            _ => {
+                let item = serde_json::to_string(object).unwrap_or_else(|error| {
+                    format!("<failed to serialize reasoning item: {error}>")
+                });
+                tracing::error!(
+                    key,
+                    item = %item,
+                    "unsupported reasoning item field type"
+                );
+                bail!("reasoning item `{key}` must be an array or string");
             }
         }
     }
@@ -1914,6 +1931,49 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(high.request.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn accepts_string_and_array_reasoning_content() {
+        for (content, expected) in [
+            (json!("plain reasoning"), "plain reasoning"),
+            (
+                json!([{ "type": "reasoning_text", "text": "array reasoning" }]),
+                "array reasoning",
+            ),
+            (
+                json!(["string part", { "text": " and object part" }]),
+                "string part and object part",
+            ),
+        ] {
+            let converted = responses_request_to_chat(&json!({
+                "model": "model-a",
+                "input": [{
+                    "type": "reasoning",
+                    "content": content
+                }]
+            }))
+            .unwrap();
+            assert_eq!(
+                converted.request.messages[0].reasoning_content,
+                Some(json!(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_null_reasoning_content_and_summary() {
+        let converted = responses_request_to_chat(&json!({
+            "model": "model-a",
+            "input": [{
+                "type": "reasoning",
+                "content": null,
+                "summary": [],
+                "encrypted_content": "opaque"
+            }]
+        }))
+        .unwrap();
+        assert!(converted.request.messages.is_empty());
     }
 
     #[test]
