@@ -955,6 +955,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name != CONTENT_LENGTH
         && name != CONNECTION
         && name != TRANSFER_ENCODING
+        && name != CONTENT_TYPE
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
