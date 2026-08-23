@@ -98,6 +98,8 @@ pub struct RoutingConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub base_url: Url,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proxy_url: Option<Url>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +251,14 @@ fn validate_provider_url(name: &str, provider: &ProviderConfig) -> Result<()> {
     if provider.base_url.scheme() != "http" && provider.base_url.scheme() != "https" {
         bail!("provider `{name}` base_url must use http or https");
     }
+    if let Some(proxy_url) = &provider.proxy_url {
+        if !matches!(proxy_url.scheme(), "http" | "https" | "socks5" | "socks5h") {
+            bail!("provider `{name}` proxy_url must use http, https, socks5, or socks5h");
+        }
+        if proxy_url.host_str().is_none() {
+            bail!("provider `{name}` proxy_url must contain a host");
+        }
+    }
     Ok(())
 }
 
@@ -363,6 +373,15 @@ impl ProviderConfig {
             bail!("environment variable `{env_name}` is empty");
         }
         Ok(key)
+    }
+
+    pub fn build_http_client(&self) -> Result<reqwest::Client> {
+        let mut builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if let Some(proxy_url) = &self.proxy_url {
+            builder = builder.proxy(reqwest::Proxy::all(proxy_url.clone())?);
+        }
+        Ok(builder.build()?)
     }
 
     pub fn endpoint(&self, path: &str) -> Result<Url> {
@@ -489,6 +508,7 @@ mod tests {
     fn provider_endpoint_preserves_base_prefix() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/openai/v1/").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -554,6 +574,7 @@ models = ["sol"]
     fn web_search_mcp_is_optional_and_validates_its_url() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -594,6 +615,7 @@ models = ["sol"]
     fn unprefixed_model_provider_must_exist_and_be_enabled() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -629,6 +651,7 @@ models = ["sol"]
     fn explicitly_targeted_disabled_provider_can_be_checked() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: false,
@@ -649,6 +672,7 @@ models = ["sol"]
     fn remote_compaction_models_must_be_selected_base_models() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -668,6 +692,7 @@ models = ["sol"]
     fn chat_models_must_be_selected_base_models() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -687,6 +712,7 @@ models = ["sol"]
     fn server_listeners_must_be_distinct() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,

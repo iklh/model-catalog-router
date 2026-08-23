@@ -35,7 +35,6 @@ use url::Url;
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    client: reqwest::Client,
     mode: ServiceMode,
     web_search: Option<Arc<dyn WebSearchBackend>>,
 }
@@ -153,13 +152,8 @@ fn build_router(
     mode: ServiceMode,
     web_search: Option<Arc<dyn WebSearchBackend>>,
 ) -> Result<Router> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("failed to build HTTP client")?;
     let state = AppState {
         config: Arc::new(config),
-        client,
         mode,
         web_search,
     };
@@ -267,6 +261,7 @@ async fn forward(
         )));
     }
 
+    let client = provider.build_http_client().map_err(ProxyError::internal)?;
     let path = uri.path().strip_prefix("/v1/").unwrap_or_default();
     let forwarded_model = if state.mode == ServiceMode::OpenAiCompact && path == "responses/compact"
     {
@@ -293,7 +288,7 @@ async fn forward(
             "converting Responses request"
         );
         return forward_responses_via_chat(
-            &state.client,
+            &client,
             &provider_name,
             provider,
             &payload,
@@ -318,7 +313,7 @@ async fn forward(
             "converting Responses request"
         );
         return forward_responses_via_messages(
-            &state.client,
+            &client,
             &provider_name,
             provider,
             &payload,
@@ -332,8 +327,7 @@ async fn forward(
     let api_key = provider
         .resolved_api_key(&provider_name)
         .map_err(ProxyError::internal)?;
-    let mut request = state
-        .client
+    let mut request = client
         .request(method, endpoint)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .json(&payload);
@@ -1111,6 +1105,7 @@ mod tests {
             "alpha".to_owned(),
             ProviderConfig {
                 base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                proxy_url: None,
                 api_key: Some("upstream-secret".to_owned()),
                 api_key_env: None,
                 enabled: true,
@@ -1137,7 +1132,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: None,
         };
@@ -1234,6 +1228,7 @@ mod tests {
                 "alpha".to_owned(),
                 ProviderConfig {
                     base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    proxy_url: None,
                     api_key: Some("upstream-secret".to_owned()),
                     api_key_env: None,
                     enabled: true,
@@ -1247,7 +1242,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: None,
         };
@@ -1329,6 +1323,7 @@ mod tests {
                 "alpha".to_owned(),
                 ProviderConfig {
                     base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    proxy_url: None,
                     api_key: Some("upstream-secret".to_owned()),
                     api_key_env: None,
                     enabled: true,
@@ -1342,7 +1337,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: None,
         };
@@ -1427,6 +1421,7 @@ mod tests {
                 "alpha".to_owned(),
                 ProviderConfig {
                     base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    proxy_url: None,
                     api_key: Some("upstream-secret".to_owned()),
                     api_key_env: None,
                     enabled: true,
@@ -1440,7 +1435,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: None,
         };
@@ -1525,6 +1519,7 @@ mod tests {
                 "alpha".to_owned(),
                 ProviderConfig {
                     base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    proxy_url: None,
                     api_key: Some("upstream-secret".to_owned()),
                     api_key_env: None,
                     enabled: true,
@@ -1538,7 +1533,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: Some(Arc::new(FakeWebSearch::default())),
         };
@@ -1654,7 +1648,6 @@ mod tests {
         let backend = FakeWebSearch::default();
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: Some(Arc::new(backend.clone())),
         };
@@ -1770,7 +1763,6 @@ mod tests {
         let (upstream_addr, upstream_task) = spawn(upstream_app).await;
         let router_state = AppState {
             config: Arc::new(chat_test_config(upstream_addr)),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: Some(Arc::new(FailingWebSearch)),
         };
@@ -1858,7 +1850,6 @@ mod tests {
         let backend = FakeWebSearch::default();
         let router_state = AppState {
             config: Arc::new(chat_test_config(upstream_addr)),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: Some(Arc::new(backend.clone())),
         };
@@ -1926,7 +1917,6 @@ mod tests {
         let backend = FakeWebSearch::default();
         let router_state = AppState {
             config: Arc::new(chat_test_config(upstream_addr)),
-            client: reqwest::Client::new(),
             mode: ServiceMode::Base,
             web_search: Some(Arc::new(backend.clone())),
         };
@@ -1980,6 +1970,7 @@ mod tests {
 
         let provider = ProviderConfig {
             base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+            proxy_url: None,
             api_key: Some("upstream-secret".to_owned()),
             api_key_env: None,
             enabled: true,
@@ -1999,7 +1990,6 @@ mod tests {
         };
         let router_state = AppState {
             config: Arc::new(config),
-            client: reqwest::Client::new(),
             mode: ServiceMode::OpenAiCompact,
             web_search: None,
         };
@@ -2064,6 +2054,7 @@ mod tests {
                 "alpha".to_owned(),
                 ProviderConfig {
                     base_url: Url::parse(&format!("http://{upstream_addr}/v1")).unwrap(),
+                    proxy_url: None,
                     api_key: Some("upstream-secret".to_owned()),
                     api_key_env: None,
                     enabled: true,

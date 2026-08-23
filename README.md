@@ -89,6 +89,7 @@ mcp_url = "http://127.0.0.1:9091/mcp"
 [providers.newapi-a]
 base_url = "https://newapi-a.example.com/v1"
 api_key_env = "NEWAPI_A_API_KEY"
+proxy_url = "socks5://127.0.0.1:1080"
 enabled = true
 models = ["gpt-5", "gpt-5-mini"]
 remote_compaction_models = ["gpt-5"]
@@ -129,6 +130,52 @@ NEWAPI_A_API_KEY=sk-replace-me
 ```
 
 The process environment takes precedence over the `.env` file. Logs never include API keys or Authorization headers.
+
+## Provider Proxy
+
+Each Provider supports an optional `proxy_url` setting. When set, all requests
+to that Provider (model discovery and forwarded traffic) are routed through the
+configured proxy. The proxy only affects the connection between the Router and
+the upstream Provider; it does not affect local Codex-to-Router traffic.
+
+```toml
+[providers.newapi-a]
+base_url = "https://newapi-a.example.com/v1"
+api_key_env = "NEWAPI_A_API_KEY"
+proxy_url = "http://127.0.0.1:7890"
+```
+
+Supported schemes are `http`, `https`, `socks5`, and `socks5h`. Omitting
+`proxy_url` connects directly.
+
+Proxy authentication is written inline in the URL userinfo:
+
+```toml
+proxy_url = "http://alice:s3cret@proxy.example.com:8080"
+proxy_url = "socks5://bob:hunter2@10.0.0.5:1080"
+proxy_url = "http://alice@proxy.example.com:8080"
+```
+
+If the username or password contains reserved URL characters, percent-encode them:
+
+| Character | Encoded |
+|-----------|---------|
+| `%`       | `%25`   |
+| `@`       | `%40`   |
+| `:`       | `%3A`   |
+| `/`       | `%2F`   |
+| `#`       | `%23`   |
+| `?`       | `%3F`   |
+| Space     | `%20`   |
+
+For example, a password of `p@ss:word` is written as `p%40ss%3Aword`:
+
+```toml
+proxy_url = "http://alice:p%40ss%3Aword@proxy.example.com:8080"
+```
+
+The Router does not validate proxy connectivity when saving or loading the
+configuration; a misconfigured proxy surfaces as request failures at runtime.
 
 ## Run With Codex
 

@@ -882,6 +882,7 @@ data: [DONE]
 
         let provider = ProviderConfig {
             base_url: Url::parse(&format!("http://{address}/v1")).unwrap(),
+            proxy_url: None,
             api_key: Some("upstream-secret".to_owned()),
             api_key_env: None,
             enabled: true,
@@ -941,6 +942,7 @@ data: [DONE]
 
         let provider = ProviderConfig {
             base_url: Url::parse(&format!("http://{address}/v1")).unwrap(),
+            proxy_url: None,
             api_key: Some("upstream-secret".to_owned()),
             api_key_env: None,
             enabled: true,

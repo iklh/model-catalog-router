@@ -360,8 +360,10 @@ async fn provider_wizard(
         "Enabled",
         current.map(|provider| provider.enabled).unwrap_or(true),
     )?;
+    let proxy_url = prompt_proxy(current.and_then(|provider| provider.proxy_url.as_ref()))?;
     let mut provider = ProviderConfig {
         base_url,
+        proxy_url,
         api_key,
         api_key_env,
         enabled,
@@ -477,7 +479,47 @@ fn edit_connection_details(provider: &mut ProviderConfig) -> Result<()> {
     let (api_key, api_key_env) = prompt_credentials(Some(provider))?;
     provider.api_key = api_key;
     provider.api_key_env = api_key_env;
+    provider.proxy_url = prompt_proxy(provider.proxy_url.as_ref())?;
     Ok(())
+}
+
+fn prompt_proxy(current: Option<&Url>) -> Result<Option<Url>> {
+    if let Some(current) = current {
+        println!("\nProxy:");
+        println!("1) Keep current ({current})");
+        println!("2) No proxy");
+        println!("3) Custom proxy URL");
+        return match prompt("Choice", Some("1"))?.as_str() {
+            "1" => Ok(Some(current.clone())),
+            "2" => Ok(None),
+            "3" => prompt_custom_proxy(),
+            _ => bail!("invalid proxy choice"),
+        };
+    }
+
+    println!("\nProxy:");
+    println!("1) No proxy");
+    println!("2) Custom proxy URL");
+    match prompt("Choice", Some("1"))?.as_str() {
+        "1" => Ok(None),
+        "2" => prompt_custom_proxy(),
+        _ => bail!("invalid proxy choice"),
+    }
+}
+
+fn prompt_custom_proxy() -> Result<Option<Url>> {
+    loop {
+        let input = prompt("Proxy URL", None)?;
+        match Url::parse(&input) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+                    && url.host_str().is_some() =>
+            {
+                return Ok(Some(url));
+            }
+            _ => println!("Proxy URL must be a valid http, https, socks5, or socks5h URL."),
+        }
+    }
 }
 
 fn prompt_credentials(
@@ -963,6 +1005,9 @@ fn print_provider_summary(name: &str, provider: &ProviderConfig) {
     println!("Name:     {name}");
     println!("Base URL: {}", provider.base_url);
     println!("API key:  {}", credential_summary(provider));
+    if let Some(proxy_url) = &provider.proxy_url {
+        println!("Proxy:    {proxy_url}");
+    }
     println!("Models:   {} selected", provider.models.len());
     println!("Chat:     {} selected", provider.chat_models.len());
     println!(

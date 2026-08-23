@@ -40,10 +40,6 @@ pub struct DiscoveredProviderModels {
 }
 
 pub async fn fetch_models(config: &Config) -> Result<Vec<RoutedModel>> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("failed to build HTTP client")?;
     let mut pending = FuturesUnordered::new();
 
     for (name, provider) in config
@@ -53,9 +49,9 @@ pub async fn fetch_models(config: &Config) -> Result<Vec<RoutedModel>> {
     {
         let name = name.clone();
         let provider = provider.clone();
-        let client = client.clone();
         let separator = config.catalog.separator.clone();
         pending.push(async move {
+            let client = provider.build_http_client()?;
             let api_key = provider.resolved_api_key(&name)?;
             let endpoint = provider.endpoint("models")?;
             let response = client
@@ -107,10 +103,7 @@ pub async fn discover_provider_models(
     name: &str,
     provider: &ProviderConfig,
 ) -> Result<DiscoveredProviderModels> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = provider.build_http_client()?;
     let api_key = provider.resolved_api_key(name)?;
     let endpoint = provider.endpoint("models")?;
     let response = client
@@ -427,6 +420,7 @@ mod tests {
     fn compact_catalog_uses_selected_base_ids_only() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
@@ -450,6 +444,7 @@ mod tests {
     fn chat_models_use_fixed_reasoning_levels() {
         let provider = ProviderConfig {
             base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
             api_key: Some("secret".into()),
             api_key_env: None,
             enabled: true,
