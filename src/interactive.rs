@@ -1,6 +1,6 @@
 use crate::catalog::{
     configured_models, configured_openai_compact_models, discover_provider_models,
-    DiscoveredProviderModels,
+    DiscoveredProviderModels, OPENAI_COMPACT_SUFFIX,
 };
 use crate::config::{
     default_web_search_mcp_url, validate_provider_name, validate_web_search_mcp_url, Config,
@@ -17,7 +17,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let mut config = Config::load_or_default(config_path)?;
     loop {
         print_menu(&config);
-        let choice = prompt("e/n/d/r/t/l/u/w/q> ", None)?.to_ascii_lowercase();
+        let choice = prompt("e/n/d/r/m/t/l/u/w/q> ", None)?.to_ascii_lowercase();
         if choice == "q" {
             return Ok(());
         }
@@ -26,6 +26,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
             "n" => new_provider(&config).await,
             "d" => delete_provider(&config),
             "r" => refresh_provider(&config).await,
+            "m" => edit_provider_models(&config),
             "t" => toggle_provider(&config),
             "u" => configure_unprefixed_model_provider(&config),
             "w" => configure_web_search(&config),
@@ -35,7 +36,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
             }
             "" => continue,
             _ => {
-                println!("Unknown choice. Enter e, n, d, r, t, l, u, w, or q.");
+                println!("Unknown choice. Enter e, n, d, r, m, t, l, u, w, or q.");
                 continue;
             }
         };
@@ -136,6 +137,7 @@ fn print_menu(config: &Config) {
     println!("n) New provider");
     println!("d) Delete provider");
     println!("r) Refresh provider models");
+    println!("m) Edit provider models");
     println!("t) Toggle provider enabled");
     println!("l) List provider models");
     println!("u) Configure unprefixed model provider");
@@ -584,6 +586,322 @@ async fn discover_models_with_recovery(
                 }
             }
         }
+    }
+}
+
+fn edit_provider_models(config: &Config) -> Result<Option<Config>> {
+    let Some(name) = choose_provider(config, "Provider whose models to edit")? else {
+        return Ok(None);
+    };
+    let mut provider = config
+        .providers
+        .get(&name)
+        .expect("selected provider")
+        .clone();
+    let original = provider.clone();
+
+    loop {
+        let changed = provider_model_selections_changed(&provider, &original);
+        print_model_editor_list(&name, &provider, changed);
+        let prompt_label = if changed {
+            "Number (Enter to save)"
+        } else {
+            "Number (Enter to back)"
+        };
+        let choice = prompt(prompt_label, None)?.to_ascii_lowercase();
+        match choice.as_str() {
+            "" => {
+                if changed {
+                    let mut updated = config.clone();
+                    updated.providers.insert(name, provider);
+                    return Ok(Some(updated));
+                }
+                return Ok(None);
+            }
+            "n" => {
+                let model = prompt_required("New model name")?;
+                let default_api = if recommend_chat_protocol(&model) {
+                    ModelApi::ChatCompletions
+                } else {
+                    ModelApi::Responses
+                };
+                let api = prompt_model_api(default_api)?;
+                add_model_to_provider(&mut provider, &model, api)?;
+            }
+            "s" if changed => {
+                let mut updated = config.clone();
+                updated.providers.insert(name, provider);
+                return Ok(Some(updated));
+            }
+            "r" if changed => return Ok(None),
+            "b" if !changed => return Ok(None),
+            _ => {
+                let index = choice
+                    .parse::<usize>()
+                    .context("model choice must be a number")?;
+                let old_model = provider
+                    .models
+                    .get(index.saturating_sub(1))
+                    .cloned()
+                    .context("model choice is out of range")?;
+                edit_provider_model(&mut provider, &old_model)?;
+            }
+        }
+    }
+}
+
+fn print_model_editor_list(name: &str, provider: &ProviderConfig, changed: bool) {
+    println!("\nModels for provider `{name}`:\n");
+    if provider.models.is_empty() {
+        println!("  No models configured.");
+    } else {
+        for (index, model) in provider.models.iter().enumerate() {
+            println!(
+                "{:>3}) {} ({})",
+                index + 1,
+                model,
+                model_api(provider, model).label()
+            );
+        }
+    }
+    println!("\nn) Add model manually");
+    if changed {
+        println!("s) Save and return");
+        println!("r) Discard changes and return");
+    } else {
+        println!("b) Back");
+    }
+}
+
+fn provider_model_selections_changed(provider: &ProviderConfig, original: &ProviderConfig) -> bool {
+    !same_model_selection(&provider.models, &original.models)
+        || !same_model_selection(&provider.chat_models, &original.chat_models)
+        || !same_model_selection(&provider.messages_models, &original.messages_models)
+        || !same_model_selection(
+            &provider.remote_compaction_models,
+            &original.remote_compaction_models,
+        )
+}
+
+fn same_model_selection(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort();
+    right.sort();
+    left == right
+}
+
+fn edit_provider_model(provider: &mut ProviderConfig, old_model: &str) -> Result<()> {
+    let current_api = model_api(provider, old_model);
+    println!("\nEditing model: {old_model}");
+    println!("Current API: {}\n", current_api.label());
+    println!("n) Rename model");
+    println!("a) Change model API");
+    println!("d) Delete model");
+    println!("b) Back\n");
+    let choice = prompt("Choice", Some("b"))?.to_ascii_lowercase();
+    match choice.as_str() {
+        "n" => {
+            let new_model = prompt("New model name", Some(old_model))?;
+            rename_model_in_provider(provider, old_model, &new_model)?;
+        }
+        "a" => {
+            let api = prompt_model_api(current_api)?;
+            set_model_api(provider, old_model, api)?;
+        }
+        "d" => {
+            if prompt_yes_no(&format!("Delete model `{old_model}`"), false)? {
+                remove_model_from_provider(provider, old_model)?;
+            }
+        }
+        "b" => {}
+        _ => println!("Unknown choice. Enter n, a, d, or b."),
+    }
+    Ok(())
+}
+
+fn prompt_model_api(default: ModelApi) -> Result<ModelApi> {
+    println!("\nModel API:");
+    for (index, api) in ModelApi::ALL.iter().enumerate() {
+        println!(
+            "{}) {}{}",
+            index + 1,
+            api.label(),
+            if *api == default { " (current)" } else { "" }
+        );
+    }
+    let default_choice = default.choice_number().to_string();
+    let choice = prompt("Choice", Some(&default_choice))?;
+    let index = choice
+        .parse::<usize>()
+        .context("API choice must be a number")?;
+    ModelApi::ALL
+        .get(index.saturating_sub(1))
+        .copied()
+        .context("API choice is out of range")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelApi {
+    Responses,
+    ChatCompletions,
+    AnthropicMessages,
+}
+
+impl ModelApi {
+    const ALL: [Self; 3] = [
+        Self::Responses,
+        Self::ChatCompletions,
+        Self::AnthropicMessages,
+    ];
+
+    fn choice_number(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .expect("known API has a menu choice")
+            + 1
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Responses => "OpenAI Responses",
+            Self::ChatCompletions => "Chat Completions",
+            Self::AnthropicMessages => "Anthropic Messages",
+        }
+    }
+}
+
+fn model_api(provider: &ProviderConfig, model: &str) -> ModelApi {
+    if provider
+        .chat_models
+        .iter()
+        .any(|candidate| candidate == model)
+    {
+        ModelApi::ChatCompletions
+    } else if provider
+        .messages_models
+        .iter()
+        .any(|candidate| candidate == model)
+    {
+        ModelApi::AnthropicMessages
+    } else {
+        ModelApi::Responses
+    }
+}
+
+fn validate_model_name(model: &str) -> Result<()> {
+    if model.trim().is_empty() {
+        bail!("model name must not be empty");
+    }
+    if model.ends_with(OPENAI_COMPACT_SUFFIX) {
+        bail!("model name must not end with the reserved `{OPENAI_COMPACT_SUFFIX}` suffix");
+    }
+    Ok(())
+}
+
+fn add_model_to_provider(provider: &mut ProviderConfig, model: &str, api: ModelApi) -> Result<()> {
+    validate_model_name(model)?;
+    if provider.models.iter().any(|candidate| candidate == model) {
+        bail!("model `{model}` already exists");
+    }
+    provider.models.push(model.to_owned());
+    provider.models.sort();
+    match api {
+        ModelApi::Responses => {}
+        ModelApi::ChatCompletions => {
+            provider.chat_models.push(model.to_owned());
+            provider.chat_models.sort();
+        }
+        ModelApi::AnthropicMessages => {
+            provider.messages_models.push(model.to_owned());
+            provider.messages_models.sort();
+        }
+    }
+    Ok(())
+}
+
+fn rename_model_in_provider(
+    provider: &mut ProviderConfig,
+    old_model: &str,
+    new_model: &str,
+) -> Result<()> {
+    validate_model_name(new_model)?;
+    if old_model == new_model {
+        return Ok(());
+    }
+    if provider
+        .models
+        .iter()
+        .any(|candidate| candidate != old_model && candidate == new_model)
+    {
+        bail!("model `{new_model}` already exists");
+    }
+
+    let api = model_api(provider, old_model);
+    replace_or_remove_model(&mut provider.models, old_model, Some(new_model));
+    replace_or_remove_model(&mut provider.chat_models, old_model, None);
+    replace_or_remove_model(&mut provider.messages_models, old_model, None);
+    replace_or_remove_model(
+        &mut provider.remote_compaction_models,
+        old_model,
+        Some(new_model),
+    );
+    match api {
+        ModelApi::Responses => {}
+        ModelApi::ChatCompletions => {
+            provider.chat_models.push(new_model.to_owned());
+            provider.chat_models.sort();
+        }
+        ModelApi::AnthropicMessages => {
+            provider.messages_models.push(new_model.to_owned());
+            provider.messages_models.sort();
+        }
+    }
+    Ok(())
+}
+
+fn set_model_api(provider: &mut ProviderConfig, model: &str, api: ModelApi) -> Result<()> {
+    if !provider.models.iter().any(|candidate| candidate == model) {
+        bail!("model `{model}` does not exist");
+    }
+    provider.chat_models.retain(|candidate| candidate != model);
+    provider
+        .messages_models
+        .retain(|candidate| candidate != model);
+    match api {
+        ModelApi::Responses => {}
+        ModelApi::ChatCompletions => {
+            provider.chat_models.push(model.to_owned());
+            provider.chat_models.sort();
+        }
+        ModelApi::AnthropicMessages => {
+            provider.messages_models.push(model.to_owned());
+            provider.messages_models.sort();
+        }
+    }
+    Ok(())
+}
+
+fn remove_model_from_provider(provider: &mut ProviderConfig, model: &str) -> Result<()> {
+    if provider.models.len() <= 1 {
+        bail!("provider must retain at least one model");
+    }
+    if !provider.models.iter().any(|candidate| candidate == model) {
+        bail!("model `{model}` does not exist");
+    }
+    replace_or_remove_model(&mut provider.models, model, None);
+    replace_or_remove_model(&mut provider.chat_models, model, None);
+    replace_or_remove_model(&mut provider.messages_models, model, None);
+    replace_or_remove_model(&mut provider.remote_compaction_models, model, None);
+    Ok(())
+}
+
+fn replace_or_remove_model(models: &mut Vec<String>, old_model: &str, new_model: Option<&str>) {
+    models.retain(|candidate| candidate != old_model);
+    if let Some(new_model) = new_model {
+        models.push(new_model.to_owned());
+        models.sort();
     }
 }
 
@@ -1147,6 +1465,151 @@ mod tests {
         for model in ["glm-4.5", "deepseek-v3", "qwen3-coder", "vendor/glm-4.5"] {
             assert!(recommend_chat_protocol(model), "{model}");
         }
+    }
+
+    fn model_editor_provider() -> ProviderConfig {
+        ProviderConfig {
+            base_url: Url::parse("https://example.com/v1").unwrap(),
+            proxy_url: None,
+            api_key: Some("test-key".to_owned()),
+            api_key_env: None,
+            enabled: true,
+            models: vec!["gpt-test".to_owned()],
+            chat_models: Vec::new(),
+            messages_models: Vec::new(),
+            remote_compaction_models: vec!["gpt-test".to_owned()],
+        }
+    }
+
+    #[test]
+    fn adds_models_with_the_selected_api() {
+        let mut provider = model_editor_provider();
+        add_model_to_provider(
+            &mut provider,
+            "z-ai/glm-5.3-flash:free",
+            ModelApi::ChatCompletions,
+        )
+        .unwrap();
+        add_model_to_provider(
+            &mut provider,
+            "anthropic/model",
+            ModelApi::AnthropicMessages,
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider.models,
+            vec![
+                "anthropic/model".to_owned(),
+                "gpt-test".to_owned(),
+                "z-ai/glm-5.3-flash:free".to_owned()
+            ]
+        );
+        assert_eq!(
+            provider.chat_models,
+            vec!["z-ai/glm-5.3-flash:free".to_owned()]
+        );
+        assert_eq!(provider.messages_models, vec!["anthropic/model".to_owned()]);
+        assert!(add_model_to_provider(
+            &mut provider,
+            "z-ai/glm-5.3-flash:free",
+            ModelApi::Responses
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn renames_models_across_related_model_lists() {
+        let mut provider = model_editor_provider();
+        provider.models.push("glm-test".to_owned());
+        provider.chat_models.push("glm-test".to_owned());
+
+        rename_model_in_provider(&mut provider, "glm-test", "z-ai/glm-5.3-flash:free").unwrap();
+
+        assert_eq!(
+            provider.models,
+            vec!["gpt-test".to_owned(), "z-ai/glm-5.3-flash:free".to_owned()]
+        );
+        assert_eq!(
+            provider.chat_models,
+            vec!["z-ai/glm-5.3-flash:free".to_owned()]
+        );
+        assert_eq!(provider.messages_models, Vec::<String>::new());
+    }
+
+    #[test]
+    fn switching_api_removes_the_previous_compatibility_choice() {
+        let mut provider = model_editor_provider();
+        provider.models.push("glm-test".to_owned());
+        provider.chat_models.push("glm-test".to_owned());
+
+        set_model_api(&mut provider, "glm-test", ModelApi::AnthropicMessages).unwrap();
+        assert!(!provider.chat_models.contains(&"glm-test".to_owned()));
+        assert_eq!(provider.messages_models, vec!["glm-test".to_owned()]);
+
+        set_model_api(&mut provider, "glm-test", ModelApi::Responses).unwrap();
+        assert!(!provider.chat_models.contains(&"glm-test".to_owned()));
+        assert!(!provider.messages_models.contains(&"glm-test".to_owned()));
+    }
+
+    #[test]
+    fn deletes_models_from_every_related_list() {
+        let mut provider = model_editor_provider();
+        provider.models.push("glm-test".to_owned());
+        provider.chat_models.push("glm-test".to_owned());
+        provider
+            .remote_compaction_models
+            .push("glm-test".to_owned());
+
+        remove_model_from_provider(&mut provider, "glm-test").unwrap();
+
+        assert_eq!(provider.models, vec!["gpt-test".to_owned()]);
+        assert_eq!(provider.chat_models, Vec::<String>::new());
+        assert_eq!(provider.messages_models, Vec::<String>::new());
+        assert_eq!(
+            provider.remote_compaction_models,
+            vec!["gpt-test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn detects_actual_model_selection_changes_only() {
+        let original = model_editor_provider();
+
+        assert!(!provider_model_selections_changed(&original, &original));
+
+        let reordered = ProviderConfig {
+            models: original.models.iter().rev().cloned().collect(),
+            ..original.clone()
+        };
+        assert!(!provider_model_selections_changed(&reordered, &original));
+
+        let changed = ProviderConfig {
+            chat_models: vec!["gpt-test".to_owned()],
+            ..original.clone()
+        };
+        assert!(provider_model_selections_changed(&changed, &original));
+
+        let compact_changed = ProviderConfig {
+            remote_compaction_models: Vec::new(),
+            ..original.clone()
+        };
+        assert!(provider_model_selections_changed(
+            &compact_changed,
+            &original
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_quick_model_edits() {
+        let mut provider = model_editor_provider();
+
+        assert!(
+            add_model_to_provider(&mut provider, "model-openai-compact", ModelApi::Responses)
+                .is_err()
+        );
+        assert!(rename_model_in_provider(&mut provider, "gpt-test", "").is_err());
+        assert!(remove_model_from_provider(&mut provider, "gpt-test").is_err());
     }
 
     #[test]

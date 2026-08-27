@@ -35,9 +35,12 @@ The menu supports:
 - Deleting Providers after confirmation.
 - Enabling or disabling Providers without deleting their settings.
 - Refreshing a Provider's model list.
+- Quickly editing one Provider model: add a manual model name, rename it, switch its API protocol, or delete it.
 - Storing an API key directly or naming an environment variable.
 
-When adding a Provider, automatic discovery calls its OpenAI-compatible `GET /v1/models` endpoint. A failed request can be retried, can return to the Base URL and API key prompts, or can fall back to manual entry. Press Enter to select all discovered models, or enter a complete selection such as `1,3-5`. Manual mode accepts model names without contacting the Provider or validating them.
+When adding a Provider, automatic discovery calls its OpenAI-compatible `GET /v1/models` endpoint. A failed request can be retried, can return to the Base URL and API key prompts, or can fall back to manual entry. Press Enter to select all discovered models, or enter a complete selection such as `1,3-5`. Manual mode accepts model names without contacting the Provider or validating them. The quick model editor also accepts names containing `/` and `:`, such as `z-ai/glm-5.3-flash:free`; only the Provider prefix is removed during routing.
+
+Use `Edit provider models` to select a Provider, then pick a model or add a manual one. Each model's API is one of OpenAI Responses, Chat Completions, and Anthropic Messages. Renaming or deleting a model keeps `models`, `chat_models`, `messages_models`, and `remote_compaction_models` consistent. A Provider always retains at least one model, and manually entered names may not end with the reserved `-openai-compact` suffix. Quick model edits are staged until an actual change exists; pressing Enter then saves them, while `r` discards them.
 
 Discovery treats model IDs ending in `-openai-compact` as remote-compaction aliases rather than normal selectable models. An alias is recognized only when the same response also contains its exact base model:
 
