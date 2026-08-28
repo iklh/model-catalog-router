@@ -1012,7 +1012,6 @@ pub struct ResponsesStreamConverter {
     next_output_index: usize,
     sequence_number: u64,
     text: Option<StreamOutput>,
-    reasoning: Option<StreamOutput>,
     tool_calls: BTreeMap<usize, StreamTool>,
     extra_output: Vec<(usize, Value)>,
     usage: Option<ChatUsage>,
@@ -1038,7 +1037,6 @@ impl ResponsesStreamConverter {
             next_output_index: 0,
             sequence_number: 0,
             text: None,
-            reasoning: None,
             tool_calls: BTreeMap::new(),
             extra_output: Vec::new(),
             usage: None,
@@ -1202,16 +1200,10 @@ impl ResponsesStreamConverter {
             self.finish_reason = Some(reason.clone());
         }
 
-        if let Some(delta) = choice
-            .delta
-            .reasoning_content
-            .as_ref()
-            .or(choice.delta.reasoning.as_ref())
-            .and_then(value_text_lossy)
-            .filter(|text| !text.is_empty())
-        {
-            self.push_reasoning_delta(delta, events);
-        }
+        // Chat `reasoning_content` is provider-specific and does not reliably map
+        // to a Responses reasoning summary. Do not create a separate output item
+        // from it: keeping the assistant message at output index 0 is required
+        // for Codex's incremental Markdown rendering compatibility.
         if let Some(delta) = choice
             .delta
             .content
@@ -1258,50 +1250,6 @@ impl ResponsesStreamConverter {
             }
         }
         Ok(())
-    }
-
-    fn push_reasoning_delta(&mut self, delta: String, events: &mut Vec<Value>) {
-        if self.reasoning.is_none() {
-            let output = self.new_output("reasoning");
-            self.emit(
-                events,
-                "response.output_item.added",
-                json!({
-                    "output_index": output.output_index,
-                    "item": {
-                        "id": output.item_id,
-                        "type": "reasoning",
-                        "summary": [],
-                        "status": "in_progress"
-                    }
-                }),
-            );
-            self.emit(
-                events,
-                "response.reasoning_summary_part.added",
-                json!({
-                    "item_id": output.item_id,
-                    "output_index": output.output_index,
-                    "summary_index": 0,
-                    "part": { "type": "summary_text", "text": "" }
-                }),
-            );
-            self.reasoning = Some(output);
-        }
-        let output = self.reasoning.as_mut().expect("reasoning initialized");
-        output.text.push_str(&delta);
-        let item_id = output.item_id.clone();
-        let output_index = output.output_index;
-        self.emit(
-            events,
-            "response.reasoning_summary_text.delta",
-            json!({
-                "item_id": item_id,
-                "output_index": output_index,
-                "summary_index": 0,
-                "delta": delta
-            }),
-        );
     }
 
     fn push_text_delta(&mut self, delta: String, events: &mut Vec<Value>) {
@@ -1412,43 +1360,6 @@ impl ResponsesStreamConverter {
             self.start_tool(index, events, true);
         }
 
-        if let Some(reasoning) = self.reasoning.take() {
-            self.emit(
-                events,
-                "response.reasoning_summary_text.done",
-                json!({
-                    "item_id": reasoning.item_id,
-                    "output_index": reasoning.output_index,
-                    "summary_index": 0,
-                    "text": reasoning.text
-                }),
-            );
-            self.emit(
-                events,
-                "response.reasoning_summary_part.done",
-                json!({
-                    "item_id": reasoning.item_id,
-                    "output_index": reasoning.output_index,
-                    "summary_index": 0,
-                    "part": { "type": "summary_text", "text": reasoning.text }
-                }),
-            );
-            let item = json!({
-                "id": reasoning.item_id,
-                "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": reasoning.text }],
-                "status": "completed"
-            });
-            self.emit(
-                events,
-                "response.output_item.done",
-                json!({
-                    "output_index": reasoning.output_index,
-                    "item": item
-                }),
-            );
-            final_output.push((reasoning.output_index, item));
-        }
         if let Some(text) = self.text.take() {
             self.emit(
                 events,
@@ -2643,7 +2554,7 @@ mod tests {
         assert_eq!(types[0], "response.created");
         assert_eq!(types[1], "response.in_progress");
         assert!(types.contains(&"response.output_text.delta"));
-        assert!(types.contains(&"response.reasoning_summary_text.delta"));
+        assert!(!types.contains(&"response.reasoning_summary_text.delta"));
         assert!(types.contains(&"response.function_call_arguments.delta"));
         assert!(types.contains(&"response.custom_tool_call_input.delta"));
         assert_eq!(types.last(), Some(&"response.completed"));
@@ -2666,7 +2577,7 @@ mod tests {
         assert_eq!(function_done["item"]["arguments"], "{\"cmd\":\"pwd\"}");
         let completed = events.last().unwrap();
         assert_eq!(completed["response"]["usage"]["total_tokens"], 12);
-        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 4);
+        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 3);
         let response_ids = events
             .iter()
             .filter_map(|event| event.get("response"))
