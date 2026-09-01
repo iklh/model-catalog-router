@@ -247,13 +247,13 @@ fn build_codex_catalog_with_originals(
         .enumerate()
         .map(|(index, model)| {
             let original = original_models.get(&model.upstream_id);
-            let supported_reasoning_levels = if !is_openai_model(&model.upstream_id) {
-                chat_reasoning_levels()
-            } else {
+            let supported_reasoning_levels = if is_openai_model(&model.upstream_id) {
                 original
                     .and_then(|entry| entry.get("supported_reasoning_levels"))
                     .cloned()
-                    .unwrap_or_else(|| json!([]))
+                    .unwrap_or_else(chat_reasoning_levels)
+            } else {
+                chat_reasoning_levels()
             };
             let default_reasoning_level = if reasoning_level_is_supported(
                 &supported_reasoning_levels,
@@ -479,7 +479,11 @@ mod tests {
             ["none", "low", "medium", "high"]
         );
         assert_eq!(chat["default_reasoning_level"], DEFAULT_REASONING_EFFORT);
-        assert_eq!(native["supported_reasoning_levels"], json!([]));
+        assert_eq!(
+            native["supported_reasoning_levels"],
+            chat_reasoning_levels()
+        );
+        assert_eq!(native["default_reasoning_level"], DEFAULT_REASONING_EFFORT);
     }
 
     #[test]
