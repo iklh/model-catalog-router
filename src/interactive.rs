@@ -390,8 +390,26 @@ async fn provider_wizard(
                 match discover_models_with_recovery(&name, &provider, true).await? {
                     DiscoveryOutcome::Discovered(discovered) => {
                         let current_models = current.map(|provider| provider.models.as_slice());
-                        provider.models =
-                            select_models(&discovered.models, current_models, current.is_none())?;
+                        match select_discovered_models(
+                            &discovered.models,
+                            current_models,
+                            current.is_none(),
+                        )? {
+                            ModelSelection::Discovered(models) => {
+                                provider.models = models;
+                                provider.remote_compaction_models = configure_remote_compaction(
+                                    &discovered,
+                                    &provider.models,
+                                    current.map(|provider| {
+                                        provider.remote_compaction_models.as_slice()
+                                    }),
+                                )?;
+                            }
+                            ModelSelection::Manual(models) => {
+                                provider.models = models;
+                                provider.remote_compaction_models.clear();
+                            }
+                        }
                         provider.chat_models = select_chat_models(
                             &provider.models,
                             current_models,
@@ -402,11 +420,6 @@ async fn provider_wizard(
                             &provider.chat_models,
                             current.map(|provider| provider.models.as_slice()),
                             current.map(|provider| provider.messages_models.as_slice()),
-                        )?;
-                        provider.remote_compaction_models = configure_remote_compaction(
-                            &discovered,
-                            &provider.models,
-                            current.map(|provider| provider.remote_compaction_models.as_slice()),
                         )?;
                         break;
                     }
@@ -914,15 +927,29 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
         .get(&name)
         .expect("selected provider")
         .clone();
-    let discovered = loop {
+    let (discovered, selection) = loop {
         match discover_models_with_recovery(&name, &provider, false).await? {
-            DiscoveryOutcome::Discovered(models) => break models,
+            DiscoveryOutcome::Discovered(models) => {
+                let selection =
+                    select_discovered_models(&models.models, Some(&provider.models), false)?;
+                break (models, selection);
+            }
             DiscoveryOutcome::EditConnection => edit_connection_details(&mut provider)?,
             DiscoveryOutcome::Cancel => return Ok(None),
             DiscoveryOutcome::Manual => unreachable!("manual entry is disabled during refresh"),
         }
     };
-    let selected = select_models(&discovered.models, Some(&provider.models), false)?;
+    let (selected, remote_compaction_models) = match selection {
+        ModelSelection::Discovered(selected) => {
+            let remote_compaction_models = configure_remote_compaction(
+                &discovered,
+                &selected,
+                Some(&provider.remote_compaction_models),
+            )?;
+            (selected, remote_compaction_models)
+        }
+        ModelSelection::Manual(selected) => (selected, Vec::new()),
+    };
     if selected.is_empty() {
         bail!("at least one model must be selected");
     }
@@ -936,11 +963,6 @@ async fn refresh_provider(config: &Config) -> Result<Option<Config>> {
         &chat_models,
         Some(&provider.models),
         Some(&provider.messages_models),
-    )?;
-    let remote_compaction_models = configure_remote_compaction(
-        &discovered,
-        &selected,
-        Some(&provider.remote_compaction_models),
     )?;
     let mut updated = config.clone();
     provider.models = selected;
@@ -1046,6 +1068,118 @@ fn configure_remote_compaction(
         (!current_candidates.is_empty()).then_some(current_candidates.as_slice()),
         current_candidates.is_empty(),
     )
+}
+
+enum ModelSelection {
+    Discovered(Vec<String>),
+    Manual(Vec<String>),
+}
+
+fn select_discovered_models(
+    discovered: &[String],
+    current: Option<&[String]>,
+    default_all: bool,
+) -> Result<ModelSelection> {
+    if discovered.len() <= 10 {
+        return Ok(ModelSelection::Discovered(select_models(
+            discovered,
+            current,
+            default_all,
+        )?));
+    }
+
+    println!("\nDetected {} models.", discovered.len());
+    if prompt_yes_no("Show all discovered models", false)? {
+        return Ok(ModelSelection::Discovered(select_models(
+            discovered,
+            current,
+            default_all,
+        )?));
+    }
+
+    println!("\n1) Search models");
+    println!("2) Enter models manually");
+    loop {
+        match prompt("Choice", Some("1"))?.as_str() {
+            "1" => {
+                return Ok(ModelSelection::Discovered(search_models(
+                    discovered, current,
+                )?))
+            }
+            "2" => return Ok(ModelSelection::Manual(manual_models()?)),
+            _ => println!("Unknown choice. Enter 1 or 2."),
+        }
+    }
+}
+
+fn search_models(discovered: &[String], current: Option<&[String]>) -> Result<Vec<String>> {
+    let mut selected = current
+        .unwrap_or_default()
+        .iter()
+        .filter(|model| discovered.contains(*model))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let keyword = prompt_search_keyword()?;
+        let keyword = keyword.to_ascii_lowercase();
+        let matches = discovered
+            .iter()
+            .filter(|model| !selected.contains(*model))
+            .filter(|model| model.to_ascii_lowercase().contains(&keyword))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            println!("No matching models. Try another keyword.");
+            continue;
+        }
+
+        println!(
+            "\n{} matching models; showing the first {}:\n",
+            matches.len(),
+            matches.len().min(10)
+        );
+        let displayed = &matches[..matches.len().min(10)];
+        for (index, model) in displayed.iter().enumerate() {
+            println!("{:>3}) {}", index + 1, model);
+        }
+        println!("\nEnter a selection such as 1,3-5, all, or none.");
+        let input = prompt("Select models", None)?;
+        let indices = if input.is_empty() || input.eq_ignore_ascii_case("none") {
+            Vec::new()
+        } else {
+            resolve_model_selection(&input, Vec::new(), displayed.len())?
+        };
+        selected.extend(
+            indices
+                .into_iter()
+                .map(|index| displayed[index - 1].clone()),
+        );
+
+        if !prompt_yes_no("Continue filtering models", false)? {
+            return Ok(discovered
+                .iter()
+                .filter(|model| selected.contains(*model))
+                .cloned()
+                .collect());
+        }
+    }
+}
+
+fn prompt_search_keyword() -> Result<String> {
+    loop {
+        let keyword = remove_whitespace(&prompt("Search keyword", None)?);
+        if !keyword.is_empty() {
+            return Ok(keyword);
+        }
+    }
+}
+
+fn remove_whitespace(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
 }
 
 fn select_models(
@@ -1445,6 +1579,23 @@ mod tests {
             resolve_model_selection("all", vec![1, 3], 4).unwrap(),
             vec![1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn removes_all_whitespace_from_search_keywords() {
+        assert_eq!(remove_whitespace(" hello you "), "helloyou");
+        assert_eq!(remove_whitespace(" \t\n "), "");
+    }
+
+    #[test]
+    fn matches_search_keywords_case_insensitively() {
+        let keyword = remove_whitespace(" HEL lo ").to_ascii_lowercase();
+        let models = ["hello3", "33HELLO44", "88hello", "other"];
+        let matches = models
+            .iter()
+            .filter(|model| model.to_ascii_lowercase().contains(&keyword))
+            .collect::<Vec<_>>();
+        assert_eq!(matches, vec![&"hello3", &"33HELLO44", &"88hello"]);
     }
 
     #[test]
